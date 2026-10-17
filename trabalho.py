@@ -102,14 +102,17 @@ def ligacao(fn: str, *args, tentativas: int = 3):
 # Pacotes de dados: ficheiros de trabalho dos programas, comprimidos, num ficheiro do Drive por programa
 # ---------------------------------------------------------------------------------------------------------------------
 def empacotar(nome: str) -> str:
-    ficheiros = {}
+    ficheiros, datas = {}, {}
     for pasta, prefixo in PACOTES[nome]:
         if not pasta.exists():
             continue
         for f in sorted(pasta.rglob("*")):
             if f.is_file() and "__pycache__" not in f.parts and not f.name.endswith((".tmp", ".lock")):
-                ficheiros[prefixo + f.relative_to(pasta).as_posix()] = base64.b64encode(gzip.compress(f.read_bytes(), 6, mtime=0)).decode("ascii")  # mtime fixo: igual = igual
-    return json.dumps({"versao": 1, "ficheiros": ficheiros}, sort_keys=True)
+                rel = prefixo + f.relative_to(pasta).as_posix()
+                ficheiros[rel] = base64.b64encode(gzip.compress(f.read_bytes(), 6, mtime=0)).decode("ascii")  # mtime fixo: igual = igual
+                # a data de cada ficheiro viaja com ele: os programas usam-na (pesquisa mais recente, «pesquisa de dd/mm»)
+                datas[rel] = int(f.stat().st_mtime)
+    return json.dumps({"versao": 1, "ficheiros": ficheiros, "datas": datas}, sort_keys=True)
 
 
 def desempacotar(nome: str, texto: str | None) -> None:
@@ -118,13 +121,17 @@ def desempacotar(nome: str, texto: str | None) -> None:
         pasta.mkdir(parents=True, exist_ok=True)
     if not texto:
         return
-    for rel, dados in json.loads(texto)["ficheiros"].items():
+    pacote = json.loads(texto)
+    datas = pacote.get("datas") or {}
+    for rel, dados in pacote["ficheiros"].items():
         destino = next(((p, rel[len(pre):]) for p, pre in sorted(PACOTES[nome], key=lambda x: -len(x[1])) if rel.startswith(pre)), None)
         if not destino:
             continue
         alvo = destino[0] / destino[1]
         alvo.parent.mkdir(parents=True, exist_ok=True)
         alvo.write_bytes(gzip.decompress(base64.b64decode(dados)))
+        if rel in datas:
+            os.utime(alvo, (datas[rel], datas[rel]))
 
 
 def resumo(texto: str) -> str:
@@ -304,14 +311,57 @@ class Respostas:
         self.alterados.clear()
 
 
+SINAIS_AGORA: dict[str, dict] = {}  # o sinal de cada empresa calculada nesta volta
+
+
 def empresa(resp: Respostas, t: str) -> None:
     registar(f"Empresa {t}…")
     for parte in EMPRESA_D:
-        resp.calcular("d", f"/api/empresa/{t}/{parte}")
+        estado, corpo = resp.calcular("d", f"/api/empresa/{t}/{parte}")
+        if parte == "decisao" and estado == 200 and isinstance(corpo, dict) and (corpo.get("decisao") or {}).get("nivel"):
+            dec = corpo["decisao"]
+            SINAIS_AGORA[t.upper()] = {"nivel": dec["nivel"], "rotulo": dec.get("rotulo") or dec["nivel"].upper(), "nome": corpo.get("nome") or t}
     resp.calcular("d", f"/api/wiki/{t}")
     estado, tec = pedir("d", "GET", f"/api/empresa/{t}/tecnica")
     if estado == 200 and isinstance(tec, dict):
         resp.calcular("d", f"/api/empresa/{t}/compras?moeda={urllib.parse.quote(tec.get('moeda') or '', safe='')}")
+
+
+def registar_sinais(resp: Respostas) -> None:
+    """Compara o sinal de cada empresa da carteira e da observação com o da volta anterior. As mudanças ficam em
+    sinais.json (nos dados da Análise: a lista de empresas marca-as durante 7 dias) e vão para o Telegram."""
+    estado, listas = pedir("d", "GET", "/api/listas")
+    if estado != 200 or not SINAIS_AGORA:
+        return
+    seguidas_ = {x["ticker"].upper() for k in ("carteira", "observacao") for x in (listas.get("listas") or {}).get(k, [])}
+    ficheiro = PASTAS["decisao_dados"] / "sinais.json"
+    try:
+        s = json.loads(ficheiro.read_text(encoding="utf-8")) if ficheiro.exists() else {}
+    except ValueError:
+        s = {}
+    atual, mudancas, novas = s.get("atual", {}), s.get("mudancas", []), []
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M")  # hora de Lisboa (TZ do fluxo)
+    for t, x in SINAIS_AGORA.items():
+        if t not in seguidas_:
+            continue
+        antes = atual.get(t) or {}
+        if antes.get("nivel") and antes["nivel"] != x["nivel"]:
+            novas.append({"ticker": t, "nome": x["nome"], "de": antes.get("rotulo") or antes["nivel"], "para": x["rotulo"],
+                          "de_nivel": antes["nivel"], "para_nivel": x["nivel"], "quando": agora})
+        atual[t] = {"nivel": x["nivel"], "rotulo": x["rotulo"],
+                    "desde": antes.get("desde") if antes.get("nivel") == x["nivel"] else agora}
+    limite = datetime.fromtimestamp(time.time() - 30 * 86400).strftime("%Y-%m-%d %H:%M")
+    mudancas = [m for m in mudancas + novas if m["quando"] >= limite][-100:]
+    ficheiro.write_text(json.dumps({"atual": atual, "mudancas": mudancas}, ensure_ascii=False), encoding="utf-8")
+    if not novas:
+        return
+    registar("Sinais mudados: " + ", ".join(f"{m['ticker']} {m['de']} -> {m['para']}" for m in novas))
+    resp.calcular("d", "/api/listas")  # a lista de empresas passa a mostrar a marca
+    texto = "🔄 *Sinal mudou*\n" + "\n".join(f"*{m['ticker']}*: {m['de']} → {m['para']}" for m in novas)
+    try:
+        ligacao("trab_avisar", texto)
+    except Exception as e:  # noqa: BLE001  (o aviso é um extra: não pode estragar a volta)
+        registar(f"Aviso no Telegram falhou: {e}")
 
 
 def seguidas() -> list[str]:
@@ -474,7 +524,8 @@ def main() -> int:
                     registar(f"Empresa {t} falhou: {e}")
                 if len(resp.alterados) >= 12:
                     resp.enviar()  # vai enviando: a app vê as primeiras empresas sem esperar pelas últimas
-            resp.enviar()
+        registar_sinais(resp)
+        resp.enviar()
         # 4. A Carteira no Google (painel da Decisão, técnica rápida, triagens e listas pedidas lá)
         antes = {n: (PASTAS["sync"] / n).read_text(encoding="utf-8") if (PASTAS["sync"] / n).exists() else None for n in FICHEIROS_SYNC}
         sincronizar_carteira(args.tudo)

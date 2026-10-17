@@ -6,6 +6,7 @@ wiki dos relatórios, e serve a interface (web/dist) no mesmo endereço.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -975,13 +976,25 @@ def _listas() -> dict:
 def api_listas():
     listas = _listas()
     indice = W.construir_indice()
+    mudados = _sinais_mudados()
     for k in L.LISTAS:
         for x in listas[k]:
             e = W.empresa_por_ticker(indice, x["ticker"])
             x["veredito"] = e["veredito"] if e else None
             x["ultimo_periodo"] = e["ultimo_periodo"] if e else None
             x["na_wiki"] = bool(e)
+            x["sinal_mudou"] = mudados.get(x["ticker"].upper())
     return {"listas": listas, "nomes": L.LISTAS}
+
+
+def _sinais_mudados(dias: int = 7) -> dict:
+    """Mudanças de sinal dos últimos dias (sinais.json, escrito pela nuvem em cada volta): a mais recente de cada empresa."""
+    try:
+        s = json.loads((config.pasta_dados() / "sinais.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    limite = datetime.fromtimestamp(datetime.now().timestamp() - dias * 86400).strftime("%Y-%m-%d %H:%M")
+    return {m["ticker"]: m for m in s.get("mudancas", []) if m.get("quando", "") >= limite}
 
 
 @app.post("/api/listas/{destino}")
