@@ -34,7 +34,7 @@ PASTAS_DAS_LISTAS = {"carteira": ["CARTEIRA INVESTIMENTOS", ""], "observacao": [
 TEXTO_MAX = 300_000
 
 # Pasta da empresa nos relatórios -> ticker do Yahoo, quando não coincidem com o ticker dos nomes dos ficheiros
-TICKER_YAHOO = {"VISA": "V", "BONEX": "BONEX.ST", "BONESUPPORT": "BONEX.ST", "ABB": "ABB.ST"}
+TICKER_YAHOO = {"VISA": "V", "BONEX": "BONEX.ST", "BONESUPPORT": "BONEX.ST", "ABB": "ABB.ST", "ATCO": "ATCO-A.ST"}
 
 VEREDITOS = (  # por prioridade: o primeiro padrão não negado que aparecer ganha
     ("quebrada", re.compile(r"\b(quebrad[ao]|broken|invalidad[ao])", re.I)),

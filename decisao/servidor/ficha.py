@@ -43,7 +43,8 @@ def _sem_acentos(s: str) -> str:
 # ---------------------------------------------------------------------------
 # 1. Ficha de dados
 # ---------------------------------------------------------------------------
-RE_CAIXA = re.compile(r'(?is)<div\b[^>]*\bdata-ficha\s*=\s*["\']([^"\']*)["\'][^>]*>(.*?)</div>')
+# data-ficha com ou sem aspas (<div class=ficha data-ficha=v1> é HTML válido e o Cowork às vezes escreve-o assim)
+RE_CAIXA = re.compile(r'(?is)<div\b[^>]*\bdata-ficha\s*=\s*["\']?([^"\'\s>]*)["\']?[^>]*>(.*?)</div>')
 
 
 def localizar_ficha(h: str) -> re.Match | None:
