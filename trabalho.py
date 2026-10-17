@@ -275,6 +275,10 @@ class Respostas:
         self.guardar(app, caminho, estado, corpo)
         if estado != 200:
             registar(f"  {caminho}: {estado} {str((corpo or {}).get('detail') if isinstance(corpo, dict) else '')[:150]}")
+            if estado >= 500:  # erro do programa: a causa está no registo do servidor
+                log = TRAB / f"servidor_{app}.log"
+                for l in (log.read_text(encoding="utf-8", errors="replace").splitlines()[-6:] if log.exists() else []):
+                    registar("    " + l[:200])
         elif time.time() - inicio > 20:
             registar(f"  {caminho}: {time.time() - inicio:.0f} s")
         return estado, corpo
