@@ -550,6 +550,21 @@ def da_nuvem(pasta: Path | None, estado: dict) -> None:
             tmp.write_text(texto, encoding="utf-8")
             tmp.replace(nuvem / "cowork_estado.json")
             estado["cowork_hash"] = h
+    # Lista dos relatórios do PC (caminho e data), quando muda: a nuvem compara-a com a cópia do Google Drive e avisa
+    # se algum relatório do Cowork ainda não chegou lá (ou chegou numa versão mais antiga)
+    rel = {}
+    for c in ("CARTEIRA INVESTIMENTOS", "EM OBSERVAÇÃO", "ANALISES ANTIGAS"):
+        for f in (ESTUDOS / c).rglob("*"):
+            if f.is_file() and f.suffix.lower() in (".html", ".htm"):
+                rel[f.relative_to(ESTUDOS).as_posix()] = int(f.stat().st_mtime)
+    texto_rel = json.dumps(rel, ensure_ascii=False, sort_keys=True)
+    h_rel = hashlib.sha1(texto_rel.encode("utf-8")).hexdigest()
+    if rel and estado.get("relatorios_hash") != h_rel:
+        from datetime import datetime
+        tmp = nuvem / "~pc_relatorios.json"
+        tmp.write_text(json.dumps({"quando": datetime.now().strftime("%Y-%m-%d %H:%M"), "relatorios": rel}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(nuvem / "pc_relatorios.json")
+        estado["relatorios_hash"] = h_rel
     # Sinal de vida para o painel «Nuvem» da app (de 30 em 30 minutos, para não encher o Google Drive de mudanças)
     if time.time() - estado.get("pc_visto", 0) > 1800:
         from datetime import datetime

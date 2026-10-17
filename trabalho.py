@@ -141,6 +141,25 @@ def resumo(texto: str) -> str:
 # ---------------------------------------------------------------------------------------------------------------------
 # Relatórios: cópia do OneDrive que o Google Drive do PC faz; aqui ficam em cache entre voltas (só desce o que mudou)
 # ---------------------------------------------------------------------------------------------------------------------
+def sincronia_relatorios(lista: list[dict]) -> dict:
+    """Compara os relatórios do PC (pc_relatorios.json, escrito pela ponte com o Cowork) com a cópia do Google Drive
+    que a nuvem lê. Falta = está no PC e não na cópia; atrasado = a versão do PC é mais recente do que a da cópia."""
+    try:
+        pc = json.loads(ligacao("trab_lerFicheiros", {"pasta": "nuvem", "nomes": ["pc_relatorios.json"]}).get("pc_relatorios.json") or "{}")
+    except (ValueError, RuntimeError):
+        pc = {}
+    if not pc.get("relatorios"):
+        return {"estado": "sem_lista_do_pc"}
+    drive = {x["caminho"]: x["mod"] / 1000 for x in lista}
+    falta = sorted(c for c in pc["relatorios"] if c not in drive)
+    atrasados = sorted(c for c, m in pc["relatorios"].items() if c in drive and m > drive[c] + 300)
+    r = {"estado": "iguais" if not (falta or atrasados) else "diferentes", "pc": len(pc["relatorios"]), "nuvem": len(lista),
+         "lista_pc_de": pc.get("quando"), "falta": falta[:20], "atrasados": atrasados[:20]}
+    if falta or atrasados:
+        registar(f"Relatórios por chegar à nuvem: {len(falta)} em falta, {len(atrasados)} desatualizados ({', '.join((falta + atrasados)[:5])}).")
+    return r
+
+
 def descarregar_relatorios() -> int:
     lista = ligacao("trab_relatorios")
     cache = CACHE / "relatorios"
@@ -170,7 +189,12 @@ def descarregar_relatorios() -> int:
     for nome in ("CARTEIRA INVESTIMENTOS", "EM OBSERVAÇÃO", "ANALISES ANTIGAS"):
         (PASTAS["relatorios"] / nome).mkdir(parents=True, exist_ok=True)
     registar(f"Relatórios: {len(lista)} ({len(falta)} descarregados agora).")
+    global SINCRONIA
+    SINCRONIA = sincronia_relatorios(lista)
     return len(lista)
+
+
+SINCRONIA: dict = {}
 
 
 def aplicar_mudancas_pastas() -> None:
@@ -560,7 +584,7 @@ def main() -> int:
         ligacao("trab_gravarFicheiros", {"pasta": "nuvem", "ficheiros": {"estado.json": json.dumps({
             "inicio": inicio.isoformat(timespec="seconds"), "fim": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "motivo": os.environ.get("MOTIVO") or ("pesquisa" if args.pesquisa else "agendada" if args.tudo else "pedido"),
-            "completa": bool(args.tudo or args.pesquisa), "pedidos": len(feitos),
+            "completa": bool(args.tudo or args.pesquisa), "pedidos": len(feitos), "relatorios": SINCRONIA,
             "erro": erro, "registo": REGISTO[-60:]}, ensure_ascii=False)}})
         for p in procs:
             p.terminate()
