@@ -48,6 +48,7 @@ jobs:
         env:
           LIGACAO_URL: https://script.google.com/macros/s/AKfycbzk3qOpYPN6rkf6Uwn6RB8p9gMGB_8Lar7CplCstXlbVprNrSHZMqeYYYBqbyGsJlX8/exec
           GITHUB_TOKEN: ${{ github.token }}
+          MOTIVO: ${{ inputs.motivo }}
           TZ: Europe/Lisbon
         run: |
           ARGS=""

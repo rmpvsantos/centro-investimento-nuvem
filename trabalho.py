@@ -505,7 +505,8 @@ def main() -> int:
             ligacao("trab_concluirPedidos", feitos)
         ligacao("trab_gravarFicheiros", {"pasta": "nuvem", "ficheiros": {"estado.json": json.dumps({
             "inicio": inicio.isoformat(timespec="seconds"), "fim": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "motivo": "pesquisa" if args.pesquisa else "agendada" if args.tudo else "pedido", "pedidos": len(feitos),
+            "motivo": os.environ.get("MOTIVO") or ("pesquisa" if args.pesquisa else "agendada" if args.tudo else "pedido"),
+            "completa": bool(args.tudo or args.pesquisa), "pedidos": len(feitos),
             "erro": erro, "registo": REGISTO[-60:]}, ensure_ascii=False)}})
         for p in procs:
             p.terminate()

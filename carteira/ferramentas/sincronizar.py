@@ -504,6 +504,9 @@ def listas_mudaram(estado: dict) -> bool:
 # botão «Mover para…» da Decisão faz no PC).
 # ---------------------------------------------------------------------------------------------------------------------
 ESTUDOS = Path.home() / "OneDrive" / "Ambiente de Trabalho" / "Estudos Empresas-Relatorios"
+# Desde 17/10/2026 a Carteira, a técnica rápida e as triagens calculam-se só na nuvem (as apps do PC foram retiradas):
+# no PC o vigilante é só a ponte com o Cowork (pedidos de relatório e mudanças de pasta). False volta ao modo antigo.
+SO_PONTE_COWORK = True
 
 
 def da_nuvem(pasta: Path | None, estado: dict) -> None:
@@ -547,6 +550,11 @@ def da_nuvem(pasta: Path | None, estado: dict) -> None:
             tmp.write_text(texto, encoding="utf-8")
             tmp.replace(nuvem / "cowork_estado.json")
             estado["cowork_hash"] = h
+    # Sinal de vida para o painel «Nuvem» da app (de 30 em 30 minutos, para não encher o Google Drive de mudanças)
+    if time.time() - estado.get("pc_visto", 0) > 1800:
+        from datetime import datetime
+        (nuvem / "pc_visto.json").write_text(json.dumps({"quando": datetime.now().strftime("%Y-%m-%d %H:%M")}), encoding="utf-8")
+        estado["pc_visto"] = time.time()
 
 
 def uma_volta(pasta: Path | None, forcar: bool = False) -> None:
@@ -557,6 +565,8 @@ def uma_volta(pasta: Path | None, forcar: bool = False) -> None:
         except Exception as e:  # noqa: BLE001  (a nuvem é um extra: não pode parar a sincronização)
             registar(f"Da nuvem: {type(e).__name__}: {e}")
         ESTADO.write_text(json.dumps(estado), encoding="utf-8")
+        if SO_PONTE_COWORK:
+            return
     pedidos, carteira = ler_pedidos(pasta)
     novos = [p for p in pedidos if p["id"] not in estado["tratados"]]
     triagens = [p for p in novos if p.get("acao") in ("triagem", "pares")]
