@@ -113,7 +113,8 @@ def empacotar(nome: str) -> str:
 
 
 def desempacotar(nome: str, texto: str | None) -> None:
-    for pasta, _ in PACOTES[nome]:
+    for pasta, _ in PACOTES[nome]:  # começa do zero: só fica o que está no pacote do Drive
+        shutil.rmtree(pasta, ignore_errors=True)
         pasta.mkdir(parents=True, exist_ok=True)
     if not texto:
         return
@@ -384,6 +385,31 @@ def tratar_pedidos(resp: Respostas) -> tuple[list[dict], set[str], bool]:
 # ---------------------------------------------------------------------------------------------------------------------
 # Uma volta
 # ---------------------------------------------------------------------------------------------------------------------
+def sincronizar_carteira(tudo: bool) -> None:
+    """O que o PC fazia para a Carteira no Google (painel da Decisão, técnica rápida, triagens e listas pedidas na
+    Carteira), agora pela Análise que já está a correr: o mesmo sincronizar.py, no modo nuvem."""
+    env = {**ambiente(), "SINC_NA_NUVEM": "1", "SINC_DECISAO_URL": f"http://127.0.0.1:{PORTAS['d']}",
+           "SINC_SAIDA": str(PASTAS["sync"] / "sincronizacao_carteira.json"),
+           "SINC_ESTADO": str(PASTAS["centro_dados"] / "estado_sincronizacao.json"), "SINC_MUDANCAS": str(MUDANCAS)}
+    r = subprocess.run([sys.executable, "-u", str(RAIZ / "carteira" / "ferramentas" / "sincronizar.py")] + (["--tudo"] if tudo else []),
+                       cwd=RAIZ / "carteira" / "ferramentas", env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    for l in [l for l in (r.stdout + r.stderr).splitlines() if l.strip()][-8:]:
+        registar("  Carteira: " + l[-200:])
+
+
+def guardar_dados(originais: dict) -> None:
+    """Os pacotes de dados que mudaram voltam ao Drive (e passam a ser a referência para a próxima comparação)."""
+    novos = {}
+    for nome in PACOTES:
+        texto = empacotar(nome)
+        if resumo(texto) != originais[nome]:
+            novos[nome] = texto
+            originais[nome] = resumo(texto)
+    if novos:
+        ligacao("trab_gravarFicheiros", {"pasta": "nuvem", "ficheiros": novos})
+        registar("Dados gravados no Drive: " + ", ".join(novos))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tudo", action="store_true")
@@ -398,9 +424,13 @@ def main() -> int:
         p.mkdir(parents=True, exist_ok=True)
 
     # 1. Dados, relatórios e sincronização da Carteira
-    pacotes = ligacao("trab_lerFicheiros", {"pasta": "nuvem", "nomes": list(PACOTES)})
+    pacotes = ligacao("trab_lerFicheiros", {"pasta": "nuvem", "nomes": list(PACOTES) + ["cowork_estado.json"]})
     for nome in PACOTES:
         desempacotar(nome, pacotes.get(nome))
+    # O estado dos pedidos ao Cowork que o PC devolveu (o Cowork escreve-o nos ficheiros de _PEDIDOS): o do PC manda
+    for nome, texto in json.loads(pacotes.get("cowork_estado.json") or "{}").items():
+        if re.fullmatch(r"[\w.\-]+\.json", nome):
+            (PASTAS["pedidos_cowork"] / nome).write_text(texto, encoding="utf-8")
     originais = {nome: resumo(empacotar(nome)) for nome in PACOTES}
     sync = ligacao("trab_lerFicheiros", {"pasta": "sync", "nomes": FICHEIROS_SYNC})
     for nome, texto in sync.items():
@@ -416,35 +446,61 @@ def main() -> int:
     try:
         if args.pesquisa:
             correr_pesquisas()
-        # 2. Pedidos da app
+        # 2. Pedidos da app, com as respostas gerais e as das empresas tocadas; a app recebe-os logo
         feitos, tocadas, escreveu = tratar_pedidos(resp)
-        # 3. Respostas: as gerais sempre; as empresas tocadas; todas as seguidas nas voltas agendadas
         for c in GLOBAIS_D:
             resp.calcular("d", c)
         for c in GLOBAIS_C:
             resp.calcular("c", c)
-        alvo = seguidas() if (args.tudo or args.pesquisa) else []
-        for t in list(dict.fromkeys(list(tocadas) + alvo)):
+        for t in tocadas:
             try:
                 empresa(resp, t)
             except Exception as e:  # noqa: BLE001
                 registar(f"Empresa {t} falhou: {e}")
-            if len(resp.alterados) >= 12:
-                resp.enviar()  # vai enviando: a app vê as primeiras empresas sem esperar pelas últimas
         resp.enviar()
+        guardar_dados(originais)
+        if feitos:
+            ligacao("trab_concluirPedidos", feitos)
+            feitos = []
+        # 3. Voltas agendadas: todas as empresas seguidas
+        if args.tudo or args.pesquisa:
+            for t in [t for t in seguidas() if t not in tocadas]:
+                try:
+                    empresa(resp, t)
+                except Exception as e:  # noqa: BLE001
+                    registar(f"Empresa {t} falhou: {e}")
+                if len(resp.alterados) >= 12:
+                    resp.enviar()  # vai enviando: a app vê as primeiras empresas sem esperar pelas últimas
+            resp.enviar()
+        # 4. A Carteira no Google (painel da Decisão, técnica rápida, triagens e listas pedidas lá)
+        antes = {n: (PASTAS["sync"] / n).read_text(encoding="utf-8") if (PASTAS["sync"] / n).exists() else None for n in FICHEIROS_SYNC}
+        sincronizar_carteira(args.tudo)
+        mudou = {n: (PASTAS["sync"] / n).read_text(encoding="utf-8") for n in FICHEIROS_SYNC
+                 if n != "pedidos_carteira.json" and (PASTAS["sync"] / n).exists() and (PASTAS["sync"] / n).read_text(encoding="utf-8") != antes[n]}
+        # Proteção: um ficheiro com menos empresas do que o anterior (técnica vazia, sincronização sem análises) não
+        # substitui o que a Carteira está a mostrar
+        for n, chave in (("tecnica_carteira.json", "ativos"), ("sincronizacao_carteira.json", "decisao")):
+            if n in mudou and antes.get(n):
+                try:
+                    novo, velho = json.loads(mudou[n]).get(chave) or {}, json.loads(antes[n]).get(chave) or {}
+                    tam = (lambda x: len(x.get("analises", x)) if isinstance(x, dict) else 0)
+                    if tam(velho) and tam(novo) < tam(velho) * 0.5:
+                        registar(f"Carteira: {n} novo com {tam(novo)} empresas (antes {tam(velho)}): não enviado.")
+                        mudou.pop(n)
+                except (ValueError, AttributeError):
+                    pass
+        if mudou:
+            ligacao("trab_gravarFicheiros", {"pasta": "sync", "ficheiros": mudou})
+            registar("Carteira: enviados " + ", ".join(mudou))
+            if escreveu or len(mudou) > 0:
+                resp.calcular("c", "/api/decisao/resumo")
+                resp.enviar()
     except Exception as e:  # noqa: BLE001
         erro = f"{type(e).__name__}: {e}"
         registar("ERRO: " + erro)
     finally:
-        # 4. Dados alterados de volta ao Drive; pedidos concluídos; estado da volta
-        novos = {}
-        for nome in PACOTES:
-            texto = empacotar(nome)
-            if resumo(texto) != originais[nome]:
-                novos[nome] = texto
-        if novos:
-            ligacao("trab_gravarFicheiros", {"pasta": "nuvem", "ficheiros": novos})
-            registar("Dados gravados no Drive: " + ", ".join(novos))
+        # 5. Dados alterados de volta ao Drive; pedidos que faltem concluir; estado da volta
+        guardar_dados(originais)
         if feitos:
             ligacao("trab_concluirPedidos", feitos)
         ligacao("trab_gravarFicheiros", {"pasta": "nuvem", "ficheiros": {"estado.json": json.dumps({

@@ -27,7 +27,8 @@ sys.path.insert(0, str(DECISAO / "servidor"))
 
 import wiki  # noqa: E402  (vem da Decisão de Investimento)
 
-SAIDA = Path(__file__).resolve().parent.parent / "sincronizacao_carteira.json"
+# na nuvem: o ficheiro que veio do Drive (a técnica rápida tira dele as listas)
+SAIDA = Path(os.environ.get("SINC_SAIDA") or Path(__file__).resolve().parent.parent / "sincronizacao_carteira.json")
 
 # Ticker dos relatórios / Yahoo -> ticker da folha, quando são diferentes
 ALIAS = {"RELX": "LON:REL", "NVO": "ETR:NOV", "VISA": "V"}
@@ -106,10 +107,35 @@ def ticker_yahoo(t: str) -> str:
     return t
 
 
+def analisar_http(t: str) -> dict:
+    """O mesmo que analisar() abaixo, mas pela Análise que está a correr (modo nuvem)."""
+    from urllib.parse import quote
+    q = quote(t.upper(), safe="")
+    a = _api(f"/api/empresa/{q}/decisao", 900)
+    neg = a.get("negocio") or {}
+    neg.pop("original", None)
+    try:
+        nts = _api(f"/api/empresa/{q}/noticias", 300)
+        nts = nts.get("noticias", []) if isinstance(nts, dict) else nts
+        a["noticias"] = [{k: n.get(k) for k in ("data", "titulo", "resumo", "fonte", "url")} for n in (nts or [])[:6]]
+    except Exception:  # noqa: BLE001
+        a["noticias"] = []
+    try:
+        a["niveis"] = _api(f"/api/empresa/{q}/tecnica", 300).get("niveis")
+    except Exception:  # noqa: BLE001
+        a["niveis"] = None
+    try:
+        a["notas"] = _api(f"/api/wiki/{q}", 300).get("notas") or {}
+    except Exception:  # noqa: BLE001
+        a["notas"] = {}
+    return a
+
+
 def decisao(indice: dict, extra: list[str] | None = None) -> dict:
     import listas as L  # noqa: E402
-    import main as D  # noqa: E402  (cria a app FastAPI sem a pôr a correr; só usamos as funções)
     import noticias as N  # noqa: E402
+    if not NA_NUVEM:
+        import main as D  # noqa: E402  (cria a app FastAPI sem a pôr a correr; só usamos as funções)
 
     ls = L.ler(indice)
     alvo = [(lista, x) for lista in ("carteira", "observacao") for x in ls.get(lista, [])]
@@ -121,6 +147,8 @@ def decisao(indice: dict, extra: list[str] | None = None) -> dict:
     analises, erros = {}, {}
 
     def analisar(t: str) -> dict:
+        if NA_NUVEM:  # na nuvem: a Análise já está a correr (e com as caches quentes); pede-se-lhe por HTTP
+            return analisar_http(t)
         a = D.limpo(D.bloco_decisao(t))
         neg = a.get("negocio") or {}
         neg.pop("original", None)  # o texto em inglês só ocupa espaço
@@ -157,7 +185,9 @@ def decisao(indice: dict, extra: list[str] | None = None) -> dict:
 # Pasta partilhada com a app (Google Drive para computador) e modo automático
 # ---------------------------------------------------------------------------------------------------------------------
 PASTA_SYNC = "Carteira - sincronização"
-ESTADO = Path(__file__).resolve().parent / "estado_sincronizacao.json"
+# Modo nuvem (trabalhador do Centro de Investimento no GitHub): a Análise já está a correr e o estado fica com os dados
+NA_NUVEM = bool(os.environ.get("SINC_NA_NUVEM"))
+ESTADO = Path(os.environ.get("SINC_ESTADO") or Path(__file__).resolve().parent / "estado_sincronizacao.json")
 REGISTO = Path(__file__).resolve().parent / "sincronizacao.log"
 HORAS_ENTRE_COMPLETAS = 6
 DESTINO = {"watchlist": "observacao", "carteira": "carteira", "retirar": "outros"}
@@ -203,11 +233,31 @@ def ler_estado() -> dict:
         return {"ultima_completa": 0, "tratados": []}
 
 
+def mover_http(destino: str, ticker: str) -> None:
+    """Modo nuvem: muda a lista pela Análise que está a correr; a mudança de pasta fica registada para o PC a fazer."""
+    import urllib.error
+    import urllib.request
+    from fastapi import HTTPException  # noqa: E402
+    req = urllib.request.Request(f"{SERVIDOR_DECISAO}/api/listas/{destino}", data=json.dumps({"ticker": ticker}).encode("utf-8"),
+                                 method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            res = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise HTTPException(e.code, json.loads(e.read().decode("utf-8") or "{}").get("detail", str(e))) from e
+    if res.get("movida") and os.environ.get("SINC_MUDANCAS"):
+        f = Path(os.environ["SINC_MUDANCAS"])
+        mud = json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+        mud.append({**res["movida"], "quando": datetime.now().isoformat(timespec="seconds")})
+        f.write_text(json.dumps(mud, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def tratar_pedidos(pedidos: list[dict], estado: dict) -> list[dict]:
     """Executa na Decisão de Investimento os pedidos feitos na app (mesmo efeito dos botões «Mover para…»)."""
     from fastapi import HTTPException  # noqa: E402
 
-    import main as D  # noqa: E402
+    if not NA_NUVEM:
+        import main as D  # noqa: E402
     resultados = []
     for p in pedidos:
         if p["id"] in estado["tratados"]:
@@ -216,7 +266,10 @@ def tratar_pedidos(pedidos: list[dict], estado: dict) -> list[dict]:
         try:
             if not destino:
                 raise ValueError(f"pedido desconhecido: {p.get('acao')}")
-            D.api_listas_mover(destino, {"ticker": p["ticker"]})
+            if NA_NUVEM:
+                mover_http(destino, p["ticker"])
+            else:
+                D.api_listas_mover(destino, {"ticker": p["ticker"]})
             nome = {"observacao": "watchlist (Em observação)", "carteira": "carteira", "outros": "fora das listas"}[destino]
             resultados.append({"id": p["id"], "ok": True, "mensagem": f"{p['ticker']} passou para {nome}."})
         except HTTPException as e:
@@ -255,7 +308,7 @@ def gravar(saida: dict, pasta: Path | None) -> None:
 # Triagem a pedido (pesquisa da app Carteira): usa a Decisão de Investimento que está a correr no PC (e a cache dela)
 # ---------------------------------------------------------------------------------------------------------------------
 TRIAGENS = "triagens_carteira.json"
-SERVIDOR_DECISAO = "http://127.0.0.1:8600"
+SERVIDOR_DECISAO = os.environ.get("SINC_DECISAO_URL") or "http://127.0.0.1:8600"
 CAMPOS_CRITERIO = ("criterio", "estado", "detalhe", "valor", "tipo", "limiar", "mediana_grupo", "n_grupo", "face_grupo", "desativado",
                    "eliminatorio", "personalizado")
 
@@ -436,13 +489,74 @@ def listas_mudaram(estado: dict) -> bool:
     """Mudaste as listas na própria Decisão de Investimento (acrescentar, mover, retirar)?"""
     try:
         from config import pasta_dados  # noqa: E402  (da Decisão de Investimento)
+        if NA_NUVEM:  # na nuvem o ficheiro é recriado em cada volta: conta o conteúdo, não a data
+            import hashlib
+            return hashlib.sha1((pasta_dados() / "listas.json").read_bytes()).hexdigest() != estado.get("listas_hash")
         return (pasta_dados() / "listas.json").stat().st_mtime > estado.get("ultima_completa", 0)
     except (ImportError, OSError):
         return False
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Da nuvem para o PC (só no PC): o Centro de Investimento na internet guarda os dados na pasta «Centro - nuvem» do
+# Google Drive. Os pedidos de relatório feitos lá passam para a pasta _PEDIDOS (que o Cowork lê), o estado que o Cowork
+# lá escreve volta para a nuvem, e as mudanças de lista feitas lá mudam a pasta do relatório no OneDrive (o mesmo que o
+# botão «Mover para…» da Decisão faz no PC).
+# ---------------------------------------------------------------------------------------------------------------------
+ESTUDOS = Path.home() / "OneDrive" / "Ambiente de Trabalho" / "Estudos Empresas-Relatorios"
+
+
+def da_nuvem(pasta: Path | None, estado: dict) -> None:
+    import base64
+    import gzip
+    import hashlib
+    import shutil
+
+    nuvem = pasta.parent / "Centro - nuvem" if pasta else None
+    pacote = nuvem / "dados_centro.json" if nuvem else None
+    if not pacote or not pacote.exists():
+        return
+    pedidos = ESTUDOS / "_PEDIDOS"
+    mtime = pacote.stat().st_mtime
+    if estado.get("nuvem_mtime") != mtime:
+        ficheiros = json.loads(pacote.read_text(encoding="utf-8")).get("ficheiros", {})
+        ler = lambda k: gzip.decompress(base64.b64decode(ficheiros[k]))  # noqa: E731
+        for rel in ficheiros:
+            if rel.startswith("pedidos_cowork/") and rel.endswith(".json"):
+                alvo = pedidos / rel.split("/", 1)[1]
+                if not alvo.exists():  # pedido novo feito na nuvem; os que já cá estão são do Cowork e ficam
+                    pedidos.mkdir(parents=True, exist_ok=True)
+                    tmp = alvo.with_name(alvo.name + ".tmp")
+                    tmp.write_bytes(ler(rel))
+                    tmp.replace(alvo)
+                    registar(f"Pedido ao Cowork vindo da nuvem: {alvo.name}")
+        if "mudancas_pastas.json" in ficheiros:
+            for m in json.loads(ler("mudancas_pastas.json").decode("utf-8")):
+                de, para = ESTUDOS / m["de"].replace("\\", "/"), ESTUDOS / m["para"].replace("\\", "/")
+                if de.is_dir() and not para.exists() and para.parent.is_dir():
+                    shutil.move(str(de), str(para))
+                    registar(f"Pasta mudada (lista mudada na nuvem): {m['de']} -> {m['para']}")
+        estado["nuvem_mtime"] = mtime
+    # O estado dos pedidos ao Cowork (o Cowork escreve-o nos ficheiros de _PEDIDOS) volta para a nuvem quando muda
+    if pedidos.is_dir():
+        atual = {f.name: f.read_text(encoding="utf-8", errors="replace") for f in sorted(pedidos.glob("*.json"))}
+        texto = json.dumps(atual, ensure_ascii=False, sort_keys=True)
+        h = hashlib.sha1(texto.encode("utf-8")).hexdigest()
+        if estado.get("cowork_hash") != h:
+            tmp = nuvem / "~cowork_estado.json"
+            tmp.write_text(texto, encoding="utf-8")
+            tmp.replace(nuvem / "cowork_estado.json")
+            estado["cowork_hash"] = h
+
+
 def uma_volta(pasta: Path | None, forcar: bool = False) -> None:
     estado = ler_estado()
+    if not NA_NUVEM:
+        try:
+            da_nuvem(pasta, estado)
+        except Exception as e:  # noqa: BLE001  (a nuvem é um extra: não pode parar a sincronização)
+            registar(f"Da nuvem: {type(e).__name__}: {e}")
+        ESTADO.write_text(json.dumps(estado), encoding="utf-8")
     pedidos, carteira = ler_pedidos(pasta)
     novos = [p for p in pedidos if p["id"] not in estado["tratados"]]
     triagens = [p for p in novos if p.get("acao") in ("triagem", "pares")]
@@ -469,6 +583,12 @@ def uma_volta(pasta: Path | None, forcar: bool = False) -> None:
         gravar(saida, pasta)
         if "decisao" in saida:
             estado["ultima_completa"] = time.time()
+            try:
+                import hashlib
+                from config import pasta_dados  # noqa: E402
+                estado["listas_hash"] = hashlib.sha1((pasta_dados() / "listas.json").read_bytes()).hexdigest()
+            except (ImportError, OSError):
+                pass
     finally:
         ESTADO.write_text(json.dumps(estado), encoding="utf-8")
 
@@ -497,6 +617,9 @@ def vigiar() -> None:
 
 
 def main() -> None:
+    if NA_NUVEM:  # uma volta e sai (o trabalhador da nuvem chama-a em cada execução); --tudo força a sincronização completa
+        uma_volta(pasta_drive(), forcar="--tudo" in sys.argv)
+        return
     if "--vigiar" in sys.argv:
         vigiar()
         return

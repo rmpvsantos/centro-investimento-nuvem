@@ -21,7 +21,7 @@ on:
 
 permissions:
   contents: read
-  actions: read   # a ligação confirma no GitHub que o pedido vem desta execução
+  actions: write  # a ligação confirma no GitHub que o pedido vem desta execução; e o passo final mantém o fluxo ligado
 
 concurrency:
   group: trabalhador
@@ -56,3 +56,10 @@ jobs:
           fi
           if [ "${{ inputs.tudo }}" = "true" ]; then ARGS="--tudo"; fi
           python trabalho.py $ARGS
+      - name: Manter as voltas agendadas ligadas
+        # Num repositório público, o GitHub desliga os agendamentos ao fim de 60 dias sem mudanças no código; voltar a
+        # «ligar» o fluxo em cada volta agendada evita isso.
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/trabalho.yml/enable" || true
