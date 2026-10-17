@@ -1,0 +1,1 @@
+As páginas do Centro estão no Firebase; aqui só corre a API.

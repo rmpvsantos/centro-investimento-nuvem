@@ -1,0 +1,58 @@
+name: Trabalhador do Centro de Investimento
+
+# Quando corre: a pedido da app (pela ligação Apps Script) e a horas marcadas (horas de Lisboa aproximadas: o GitHub
+# usa UTC e pode atrasar alguns minutos). Às segundas, à tarde, correm também as pesquisas automáticas.
+on:
+  workflow_dispatch:
+    inputs:
+      motivo:
+        description: Porque corre
+        required: false
+        default: pedido
+      tudo:
+        description: Recalcular todas as empresas seguidas
+        type: boolean
+        default: false
+  schedule:
+    - cron: "15 7 * * 1-5"    # manhã (antes da abertura na Europa)
+    - cron: "30 14 * * 1-5"   # tarde (abertura nos EUA)
+    - cron: "45 21 * * 1-5"   # noite (depois do fecho nos EUA)
+    - cron: "0 17 * * 1"      # segundas: pesquisas automáticas «EUA E CANADA» e «EUROPA»
+
+permissions:
+  contents: read
+  actions: read   # a ligação confirma no GitHub que o pedido vem desta execução
+
+concurrency:
+  group: trabalhador
+  cancel-in-progress: false
+
+jobs:
+  volta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Memória entre voltas (relatórios já descarregados e dados do Yahoo)
+        uses: actions/cache@v4
+        with:
+          path: /tmp/centro-cache
+          key: centro-${{ github.run_id }}
+          restore-keys: centro-
+      - name: Volta
+        env:
+          LIGACAO_URL: https://script.google.com/macros/s/AKfycbzk3qOpYPN6rkf6Uwn6RB8p9gMGB_8Lar7CplCstXlbVprNrSHZMqeYYYBqbyGsJlX8/exec
+          GITHUB_TOKEN: ${{ github.token }}
+          TZ: Europe/Lisbon
+        run: |
+          ARGS=""
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${{ github.event.schedule }}" = "0 17 * * 1" ]; then ARGS="--pesquisa"; else ARGS="--tudo"; fi
+          fi
+          if [ "${{ inputs.tudo }}" = "true" ]; then ARGS="--tudo"; fi
+          python trabalho.py $ARGS
