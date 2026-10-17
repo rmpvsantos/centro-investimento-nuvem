@@ -157,6 +157,9 @@ def descarregar_relatorios() -> int:
         alvo = PASTAS["relatorios"] / x["caminho"]
         alvo.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(cache / x["cache"], alvo)
+        # a data do ficheiro é a do relatório (a Análise usa-a quando o nome não traz data); sem isto, todos
+        # apareciam com a data do dia em que a nuvem os descarregou
+        os.utime(alvo, (x["mod"] / 1000, x["mod"] / 1000))
     for nome in ("CARTEIRA INVESTIMENTOS", "EM OBSERVAÇÃO", "ANALISES ANTIGAS"):
         (PASTAS["relatorios"] / nome).mkdir(parents=True, exist_ok=True)
     registar(f"Relatórios: {len(lista)} ({len(falta)} descarregados agora).")
