@@ -139,6 +139,75 @@ def resumo(texto: str) -> str:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# Memória entre voltas (pedido do Rui a 18/10/2026): cada ficheiro do Drive guarda-se no cache do GitHub Actions e só se
+# volta a descarregar quando a impressão digital (MD5) do Drive for diferente da da cópia guardada. Na dúvida (sem
+# impressão digital, erro, voltas agendadas), descarrega-se tudo, como antes.
+# ---------------------------------------------------------------------------------------------------------------------
+MEMORIA = CACHE / "ficheiros"
+TRANSFERENCIA = {"iguais": 0, "descarregados": 0, "memoria": True}
+
+
+def _md5(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
+
+
+def lembrar(pasta: str, nome: str, texto: str | None) -> None:
+    """A cópia guardada passa a ser o que o Drive tem (depois de o trabalhador o gravar ou descarregar)."""
+    f = MEMORIA / pasta / nome
+    f.parent.mkdir(parents=True, exist_ok=True)
+    if texto is None:
+        f.unlink(missing_ok=True)
+    else:
+        f.write_bytes(texto.encode("utf-8"))
+
+
+def ler_drive(pasta: str, nomes: list[str]) -> dict:
+    """{nome: texto ou None}, como trab_lerFicheiros, mas com a cópia guardada quando o conteúdo é igual ao do Drive."""
+    conhecidos = {}
+    if TRANSFERENCIA["memoria"]:
+        for n in nomes:
+            f = MEMORIA / pasta / n
+            if f.exists():
+                conhecidos[n] = _md5(f.read_bytes())
+    try:
+        r = ligacao("trab_lerFicheirosMd5", {"pasta": pasta, "nomes": nomes, "conhecidos": conhecidos})
+    except RuntimeError as e:
+        registar(f"Memória entre voltas indisponível ({str(e)[:80]}): descarrega tudo.")
+        r = None
+    if not isinstance(r, dict):
+        textos = ligacao("trab_lerFicheiros", {"pasta": pasta, "nomes": nomes})
+        for n in nomes:
+            lembrar(pasta, n, textos.get(n))
+        TRANSFERENCIA["descarregados"] += len(nomes)
+        return textos
+    out = {}
+    for n in nomes:
+        x = r.get(n)
+        if x is None:
+            out[n] = None
+            lembrar(pasta, n, None)
+        elif x.get("igual"):
+            out[n] = (MEMORIA / pasta / n).read_bytes().decode("utf-8")
+            TRANSFERENCIA["iguais"] += 1
+        else:
+            out[n] = x.get("texto")
+            lembrar(pasta, n, out[n])
+            TRANSFERENCIA["descarregados"] += 1
+    return out
+
+
+# Respostas comprimidas («gz:» + gzip em base64): ~5 vezes mais pequenas, iguais depois de abertas
+def comprimir(texto: str) -> str:
+    return "gz:" + base64.b64encode(gzip.compress(texto.encode("utf-8"), 6, mtime=0)).decode("ascii")
+
+
+def descomprimir(texto: str | None) -> str | None:
+    if texto and texto.startswith("gz:"):
+        return gzip.decompress(base64.b64decode(texto[3:])).decode("utf-8")
+    return texto
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # Relatórios: cópia do OneDrive que o Google Drive do PC faz; aqui ficam em cache entre voltas (só desce o que mudou)
 # ---------------------------------------------------------------------------------------------------------------------
 def sincronia_relatorios(lista: list[dict]) -> dict:
@@ -279,7 +348,9 @@ def grupo_de(app: str, caminho: str) -> str:
         m = re.match(r"^/api/(?:empresa|wiki|comparar)/([^/]+)", c)
     else:
         m = re.match(r"^/api/pesquisa/(?:criterios|analisar)/([^/]+)", c)
-    return f"{app}_{_limpo(m.group(1))}" if m else f"{app}_global"
+    g = f"{app}_{_limpo(m.group(1))}" if m else f"{app}_global"
+    # os 5 anos de preços do gráfico (pedidos à parte) ficam num ficheiro próprio: não pesam ao abrir a empresa
+    return g + "_5A" if "anos=5" in caminho else g
 
 
 class Respostas:
@@ -292,9 +363,9 @@ class Respostas:
     def _carregar(self, grupos: list[str]) -> None:
         falta = [g for g in grupos if g not in self.grupos]
         if falta:
-            lidos = ligacao("trab_lerFicheiros", {"pasta": "respostas", "nomes": [g + ".json" for g in falta]})
+            lidos = ler_drive("respostas", [g + ".json" for g in falta])
             for g in falta:
-                texto = lidos.get(g + ".json")
+                texto = descomprimir(lidos.get(g + ".json"))
                 self.grupos[g] = json.loads(texto) if texto else {"chaves": {}}
 
     def guardar(self, app: str, caminho: str, estado: int, corpo) -> str:
@@ -322,15 +393,21 @@ class Respostas:
         if not self.alterados:
             return
         lote, tam = {}, 0
+
+        def gravar(lote_):
+            ligacao("trab_gravarFicheiros", {"pasta": "respostas", "ficheiros": lote_})
+            for nome, t in lote_.items():
+                lembrar("respostas", nome, t)
+
         for g in sorted(self.alterados):
-            texto = json.dumps({**self.grupos[g], "gerado": datetime.now(timezone.utc).isoformat(timespec="seconds")}, ensure_ascii=False)
+            texto = comprimir(json.dumps({**self.grupos[g], "gerado": datetime.now(timezone.utc).isoformat(timespec="seconds")}, ensure_ascii=False))
             if lote and tam + len(texto) > 8_000_000:
-                ligacao("trab_gravarFicheiros", {"pasta": "respostas", "ficheiros": lote})
+                gravar(lote)
                 lote, tam = {}, 0
             lote[g + ".json"] = texto
             tam += len(texto)
         if lote:
-            ligacao("trab_gravarFicheiros", {"pasta": "respostas", "ficheiros": lote})
+            gravar(lote)
         registar(f"Respostas enviadas: {len(self.alterados)} grupo(s).")
         self.alterados.clear()
 
@@ -475,6 +552,16 @@ def sincronizar_carteira(tudo: bool) -> None:
         registar("  Carteira: " + l[-200:])
 
 
+def carteira_pediu() -> bool:
+    """A Carteira deixou pedidos por tratar (triagens, listas) em pedidos_carteira.json?"""
+    f = PASTAS["sync"] / "pedidos_carteira.json"
+    try:
+        pj = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    except ValueError:
+        return True  # na dúvida, sincroniza
+    return any(str(p.get("estado") or "") not in ("feito", "erro") for p in (pj.get("pedidos") or []))
+
+
 def guardar_dados(originais: dict) -> None:
     """Os pacotes de dados que mudaram voltam ao Drive (e passam a ser a referência para a próxima comparação)."""
     novos = {}
@@ -485,6 +572,8 @@ def guardar_dados(originais: dict) -> None:
             originais[nome] = resumo(texto)
     if novos:
         ligacao("trab_gravarFicheiros", {"pasta": "nuvem", "ficheiros": novos})
+        for nome, texto in novos.items():
+            lembrar("nuvem", nome, texto)
         registar("Dados gravados no Drive: " + ", ".join(novos))
 
 
@@ -501,8 +590,11 @@ def main() -> int:
     for p in PASTAS.values():
         p.mkdir(parents=True, exist_ok=True)
 
-    # 1. Dados, relatórios e sincronização da Carteira
-    pacotes = ligacao("trab_lerFicheiros", {"pasta": "nuvem", "nomes": list(PACOTES) + ["cowork_estado.json"]})
+    # 1. Dados, relatórios e sincronização da Carteira. Nas voltas agendadas (e em «Atualizar agora») descarrega-se tudo de
+    # raiz; nos pedidos da app usa-se a cópia guardada dos ficheiros iguais aos do Drive
+    TRANSFERENCIA["memoria"] = not (args.tudo or args.pesquisa)
+    t0 = time.time()
+    pacotes = ler_drive("nuvem", list(PACOTES) + ["cowork_estado.json"])
     for nome in PACOTES:
         desempacotar(nome, pacotes.get(nome))
     # O estado dos pedidos ao Cowork que o PC devolveu (o Cowork escreve-o nos ficheiros de _PEDIDOS): o do PC manda
@@ -513,11 +605,15 @@ def main() -> int:
     global DIARIO_ANTES
     f_diario = PASTAS["decisao_dados"] / "diario.json"
     DIARIO_ANTES = f_diario.read_text(encoding="utf-8") if f_diario.exists() else None
-    sync = ligacao("trab_lerFicheiros", {"pasta": "sync", "nomes": FICHEIROS_SYNC})
+    sync = ler_drive("sync", FICHEIROS_SYNC)
     for nome, texto in sync.items():
         if texto:
             (PASTAS["sync"] / nome).write_text(texto, encoding="utf-8")
+    t1 = time.time()
+    registar(f"Dados do Drive em {t1 - t0:.0f} s: {TRANSFERENCIA['iguais']} da cópia guardada (iguais ao Drive), "
+             f"{TRANSFERENCIA['descarregados']} descarregados.")
     descarregar_relatorios()
+    registar(f"Lista dos relatórios em {time.time() - t1:.0f} s.")
     aplicar_mudancas_pastas()
 
     procs = arrancar()
@@ -561,9 +657,17 @@ def main() -> int:
         if args.tudo or args.pesquisa or (diario.read_text(encoding="utf-8") if diario.exists() else None) != DIARIO_ANTES:
             resp.calcular("d", "/api/diario")
         resp.enviar()
-        # 4. A Carteira no Google (painel da Decisão, técnica rápida, triagens e listas pedidas lá)
+        # 4. A Carteira no Google (painel da Decisão, técnica rápida, triagens e listas pedidas lá): nas voltas agendadas,
+        # quando a app gravou alguma coisa (mudar de lista, notas, regras) ou quando a Carteira deixou pedidos por tratar.
+        # Num clique só de leitura não corre (era 1,5 minutos que atrasavam o pedido seguinte).
+        if not (args.tudo or args.pesquisa or escreveu or carteira_pediu()):
+            registar("Carteira: sem mudanças a sincronizar nesta volta (corre nas voltas agendadas).")
+            return_sem_carteira = True
+        else:
+            return_sem_carteira = False
         antes = {n: (PASTAS["sync"] / n).read_text(encoding="utf-8") if (PASTAS["sync"] / n).exists() else None for n in FICHEIROS_SYNC}
-        sincronizar_carteira(args.tudo)
+        if not return_sem_carteira:
+            sincronizar_carteira(args.tudo)
         mudou = {n: (PASTAS["sync"] / n).read_text(encoding="utf-8") for n in FICHEIROS_SYNC
                  if n != "pedidos_carteira.json" and (PASTAS["sync"] / n).exists() and (PASTAS["sync"] / n).read_text(encoding="utf-8") != antes[n]}
         # Proteção: um ficheiro com menos empresas do que o anterior (técnica vazia, sincronização sem análises) não
@@ -580,6 +684,8 @@ def main() -> int:
                     pass
         if mudou:
             ligacao("trab_gravarFicheiros", {"pasta": "sync", "ficheiros": mudou})
+            for nome, texto in mudou.items():
+                lembrar("sync", nome, texto)
             registar("Carteira: enviados " + ", ".join(mudou))
             if escreveu or len(mudou) > 0:
                 resp.calcular("c", "/api/decisao/resumo")
@@ -596,6 +702,7 @@ def main() -> int:
             "inicio": inicio.isoformat(timespec="seconds"), "fim": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "motivo": os.environ.get("MOTIVO") or ("pesquisa" if args.pesquisa else "agendada" if args.tudo else "pedido"),
             "completa": bool(args.tudo or args.pesquisa), "pedidos": len(feitos), "relatorios": SINCRONIA,
+            "transferencia": {k: TRANSFERENCIA[k] for k in ("iguais", "descarregados", "memoria")},
             "erro": erro, "registo": REGISTO[-60:]}, ensure_ascii=False)}})
         for p in procs:
             p.terminate()

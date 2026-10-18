@@ -1030,9 +1030,26 @@ def api_fundamental(ticker: str):
     return _executar(bloco_fundamental, _t(ticker))
 
 
+DIAS_GRAFICO = 520  # ~2 anos de sessões no gráfico por omissão (pedido do Rui a 18/10/2026: abrir uma empresa mais depressa)
+
+
+def cortar_tecnica(r: dict, sessoes: int) -> dict:
+    """Só as últimas `sessoes` velas para o gráfico e as séries alinhadas com elas. Os indicadores (MM200, RSI, MACD,
+    suportes e resistências, último valor, tendência) já vêm calculados com os 5 anos inteiros: não mudam."""
+    n = len(r.get("barras") or [])
+    if n <= sessoes:
+        return r
+    corta = lambda s: s[-sessoes:] if isinstance(s, list) and len(s) == n else s  # noqa: E731
+    return {**r, "barras": r["barras"][-sessoes:], "mm20": corta(r.get("mm20")), "mm50": corta(r.get("mm50")),
+            "mm200": corta(r.get("mm200")), "rsi": corta(r.get("rsi")),
+            "macd": {k: corta(v) for k, v in (r.get("macd") or {}).items()}, "anos_grafico": 2}
+
+
 @app.get("/api/empresa/{ticker}/tecnica")
-def api_tecnica(ticker: str):
-    return _executar(bloco_tecnica, _t(ticker))
+def api_tecnica(ticker: str, anos: int = 2):
+    """anos=5: os 5 anos de preços no gráfico (botão «5A»); por omissão, os 2 últimos."""
+    r = _executar(bloco_tecnica, _t(ticker))
+    return r if anos >= 5 else cortar_tecnica(r, DIAS_GRAFICO)
 
 
 @app.get("/api/empresa/{ticker}/qualitativa")
