@@ -336,6 +336,7 @@ class Respostas:
 
 
 SINAIS_AGORA: dict[str, dict] = {}  # o sinal de cada empresa calculada nesta volta
+DIARIO_ANTES: str | None = None     # o diário de decisões no início da volta (para saber se entrou um sinal novo)
 
 
 def empresa(resp: Respostas, t: str) -> None:
@@ -509,6 +510,9 @@ def main() -> int:
         if re.fullmatch(r"[\w.\-]+\.json", nome):
             (PASTAS["pedidos_cowork"] / nome).write_text(texto, encoding="utf-8")
     originais = {nome: resumo(empacotar(nome)) for nome in PACOTES}
+    global DIARIO_ANTES
+    f_diario = PASTAS["decisao_dados"] / "diario.json"
+    DIARIO_ANTES = f_diario.read_text(encoding="utf-8") if f_diario.exists() else None
     sync = ligacao("trab_lerFicheiros", {"pasta": "sync", "nomes": FICHEIROS_SYNC})
     for nome, texto in sync.items():
         if texto:
@@ -549,6 +553,13 @@ def main() -> int:
                 if len(resp.alterados) >= 12:
                     resp.enviar()  # vai enviando: a app vê as primeiras empresas sem esperar pelas últimas
         registar_sinais(resp)
+        # Candidatas (sem rede: lê o resumo de cada decisão) sempre que se calculou alguma empresa; o Diário (vai ao Yahoo
+        # buscar os preços de todas) nas voltas completas e quando entrou um sinal novo
+        if SINAIS_AGORA:
+            resp.calcular("d", "/api/candidatas")
+        diario = PASTAS["decisao_dados"] / "diario.json"
+        if args.tudo or args.pesquisa or (diario.read_text(encoding="utf-8") if diario.exists() else None) != DIARIO_ANTES:
+            resp.calcular("d", "/api/diario")
         resp.enviar()
         # 4. A Carteira no Google (painel da Decisão, técnica rápida, triagens e listas pedidas lá)
         antes = {n: (PASTAS["sync"] / n).read_text(encoding="utf-8") if (PASTAS["sync"] / n).exists() else None for n in FICHEIROS_SYNC}

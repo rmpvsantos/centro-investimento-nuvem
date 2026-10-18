@@ -11,6 +11,15 @@ Cada filtro tem um estado: passa, falha, não verificável (campo em falta ou em
 «tendência 3a»). Nunca «passa» sem verificação. Com um filtro não verificável, as regras não dão COMPRAR nem ACUMULAR.
 O ROIC parcial não bloqueia nem gera divergência sozinho, mas um COMPRAR / ACUMULAR fica «não confirmado».
 
+Regras por setor (pedido do Rui a 18/10/2026): o ROIC e o WACC não medem bancos e seguradoras (o capital é a
+matéria-prima do negócio) nem REIT (ativos imobiliários de retorno baixo e estável, financiados com dívida). Nesses
+setores a regra de ROIC é substituída:
+  - bancos e seguradoras: regra de ROE — ROE ≥ 10%, acima do custo do capital próprio (Ke) e tendência a 3 anos não
+    descendente (campos «ROE X% (…)» e «Ke X%» da linha «Filtros:»);
+  - REIT: regra do REIT — payout do AFFO ≤ 90% e dívida líquida / EBITDA ≤ 6 (campos «payout AFFO X%» e
+    «dívida/EBITDA X»).
+O setor vem da indústria do Yahoo (tipo_setor). Sem os campos do setor, esse filtro fica «não verificável».
+
 Desconto = 1 − preço / valor (positivo = preço abaixo do valor): a única convenção da app.
 Todos os limiares estão na tabela LIMIARES (calibração sem backtest). Não os repetir noutros sítios.
 """
@@ -26,7 +35,26 @@ LIMIARES = {
     "gestao_min": 3.0,         # em 5
     "governacao_min": 3.0,     # em 5
     "roic_min": 0.10,          # ROIC dos últimos 12 meses
+    "roe_min": 0.10,           # bancos e seguradoras: ROE dos últimos 12 meses
+    "payout_affo_max": 0.90,   # REIT: dividendos ÷ AFFO
+    "divida_ebitda_max": 6.0,  # REIT: dívida líquida ÷ EBITDA
+    "peso_max_posicao": 0.15,  # carteira: peso de uma ação no total investido (ações e ETF) a partir do qual há aviso
+    "peso_max_setor": 0.35,    # carteira: peso de um setor (sem os ETF diversificados) a partir do qual há aviso
 }
+TIPOS_SETOR = {"banco": "banco", "seguradora": "seguradora", "reit": "REIT"}
+
+
+def tipo_setor(setor: str | None, industria: str | None) -> str | None:
+    """«banco», «seguradora», «reit» ou None (as outras empresas seguem a regra de ROIC), pela indústria do Yahoo.
+    Visa, Moody's ou S&P Global (serviços financeiros sem balanço de crédito) ficam com a regra de ROIC."""
+    i = (industria or "").strip().lower()
+    if i.startswith("banks") or i in ("mortgage finance",):
+        return "banco"
+    if i.startswith("insurance"):
+        return "seguradora"
+    if i.startswith("reit"):
+        return "reit"
+    return None
 RESULTADOS_ACEITES = ("merecem confiança", "merecem confiança com reservas")
 TOLERANCIA_PROB = 0.005        # as probabilidades têm de somar 100% (±0,5 pontos)
 PASSA, FALHA, POR_VERIFICAR, PARCIAL = "passa", "falha", "nao_verificavel", "parcial"
@@ -96,8 +124,9 @@ def cenarios_validos(c: dict | None) -> str | None:
 # ---------------------------------------------------------------------------
 # Filtros: passa / falha / não verificável
 # ---------------------------------------------------------------------------
-def avaliar_filtros(f: dict | None) -> dict:
-    """Cada filtro com o estado, o valor, o limiar e o motivo. A média das notas é só informação, nunca critério."""
+def avaliar_filtros(f: dict | None, tipo: str | None = None) -> dict:
+    """Cada filtro com o estado, o valor, o limiar e o motivo. A média das notas é só informação, nunca critério.
+    tipo (de tipo_setor): bancos e seguradoras trocam a regra de ROIC pela de ROE; REIT pela regra do REIT."""
     L, f = LIMIARES, f or {}
 
     def item(nome, valor, regra, estado, nota=None):
@@ -123,25 +152,40 @@ def avaliar_filtros(f: dict | None) -> dict:
                           PASSA if res in RESULTADOS_ACEITES else FALHA,
                           "com reservas: peso-alvo reduzido" if res == "merecem confiança com reservas" else None))
 
-    roic, wacc = (f.get("roic") or {}).get("ttm"), f.get("wacc")
-    regra_roic = f"ROIC ≥ {_pct(L['roic_min'], 0)}, acima do WACC e tendência a 3 anos não descendente"
-    media = (f.get("roic") or {}).get("media_5a")
-    ref5 = f"; média a 5 anos {_pct(media)} (só referência)" if _ok(media) else ""
-    if not (_ok(roic) and _ok(wacc)):
-        lista.append(item("Regra de ROIC", "lacuna", regra_roic, POR_VERIFICAR, "falta o ROIC ou o WACC na linha «Filtros:»"))
-    else:
-        valor = f"ROIC {_pct(roic)} · WACC {_pct(wacc)} · spread {_n((roic - wacc) * 100, 1)} pontos percentuais"
-        tend = (f.get("roic") or {}).get("tendencia_3a")
-        if roic < L["roic_min"] or roic <= wacc:
-            lista.append(item("Regra de ROIC", valor, regra_roic, FALHA, f"ROIC abaixo do mínimo ou do WACC{ref5}"))
-        elif tend is None:
-            lista.append(item("Regra de ROIC", valor, regra_roic, PARCIAL,
-                              f"parcial: tendência não verificável (nível e WACC cumprem; a linha «Filtros:» não traz "
-                              f"«tendência 3a»){ref5}"))
-        elif tend in TENDENCIAS_ROIC_OK:
-            lista.append(item("Regra de ROIC", valor, regra_roic, PASSA, f"tendência a 3 anos {tend}{ref5}"))
+    def regra_retorno(nome, sigla, chave, sigla_custo, chave_custo, minimo, nota_setor=""):
+        """Regra de ROIC (ou de ROE, nos bancos e seguradoras): nível mínimo, acima do custo do capital e tendência."""
+        ret, custo = (f.get(chave) or {}).get("ttm"), f.get(chave_custo)
+        regra = f"{sigla} ≥ {_pct(minimo, 0)}, acima do {sigla_custo} e tendência a 3 anos não descendente"
+        media = (f.get(chave) or {}).get("media_5a")
+        ref5 = f"; média a 5 anos {_pct(media)} (só referência)" if _ok(media) else ""
+        ref5 += nota_setor
+        if not (_ok(ret) and _ok(custo)):
+            return item(nome, "lacuna", regra, POR_VERIFICAR, f"falta o {sigla} ou o {sigla_custo} na linha «Filtros:»{nota_setor}")
+        valor = f"{sigla} {_pct(ret)} · {sigla_custo} {_pct(custo)} · spread {_n((ret - custo) * 100, 1)} pontos percentuais"
+        tend = (f.get(chave) or {}).get("tendencia_3a")
+        if ret < minimo or ret <= custo:
+            return item(nome, valor, regra, FALHA, f"{sigla} abaixo do mínimo ou do {sigla_custo}{ref5}")
+        if tend is None:
+            return item(nome, valor, regra, PARCIAL, f"parcial: tendência não verificável (nível e {sigla_custo} cumprem; a "
+                                                     f"linha «Filtros:» não traz «tendência 3a»){ref5}")
+        return item(nome, valor, regra, PASSA if tend in TENDENCIAS_ROIC_OK else FALHA, f"tendência a 3 anos {tend}{ref5}")
+
+    if tipo in ("banco", "seguradora"):
+        lista.append(regra_retorno("Regra de ROE", "ROE", "roe", "custo do capital próprio", "ke", L["roe_min"],
+                                   f"; {TIPOS_SETOR[tipo]}: o ROIC e o WACC não medem este negócio"))
+    elif tipo == "reit":
+        payout, divida = f.get("payout_affo"), f.get("divida_ebitda")
+        regra = f"payout do AFFO ≤ {_pct(L['payout_affo_max'], 0)} e dívida líquida / EBITDA ≤ {_n(L['divida_ebitda_max'], 1)}"
+        nota_reit = "REIT: o ROIC e o WACC não medem este negócio"
+        if not (_ok(payout) and _ok(divida)):
+            lista.append(item("Regra do REIT", "lacuna", regra, POR_VERIFICAR,
+                              f"falta o payout do AFFO ou a dívida/EBITDA na linha «Filtros:»; {nota_reit}"))
         else:
-            lista.append(item("Regra de ROIC", valor, regra_roic, FALHA, f"tendência a 3 anos {tend}{ref5}"))
+            valor = f"payout do AFFO {_pct(payout)} · dívida líquida / EBITDA {_n(divida, 1)}"
+            passa = payout <= L["payout_affo_max"] + 1e-12 and divida <= L["divida_ebitda_max"] + 1e-12
+            lista.append(item("Regra do REIT", valor, regra, PASSA if passa else FALHA, nota_reit))
+    else:
+        lista.append(regra_retorno("Regra de ROIC", "ROIC", "roic", "WACC", "wacc", L["roic_min"]))
 
     falhados = [x["filtro"] for x in lista if x["estado"] == FALHA]
     por_verificar = [x["filtro"] for x in lista if x["estado"] == POR_VERIFICAR]
@@ -225,17 +269,32 @@ def texto_datas(data_cenarios: str | None, data_preco: str | None, hoje: str | N
 # ---------------------------------------------------------------------------
 # Verificação da Ficha
 # ---------------------------------------------------------------------------
+CAMPOS_DO_SETOR = {None: ("roic", "wacc"), "banco": ("roe", "ke"), "seguradora": ("roe", "ke"),
+                   "reit": ("payout_affo", "divida_ebitda")}
+
+
+def faltam_do_setor(faltam: list[str], filtros: dict | None, tipo: str | None) -> list[str]:
+    """O que falta na linha «Filtros:» para o setor: num banco, faltar o ROIC não conta, mas faltar o ROE conta."""
+    proprios = CAMPOS_DO_SETOR.get(tipo, CAMPOS_DO_SETOR[None])
+    alheios = {c for v in CAMPOS_DO_SETOR.values() for c in v} - set(proprios)
+    out = [x for x in faltam if x.removeprefix("filtros.") not in alheios]
+    if filtros is not None:
+        out += [f"filtros.{c}" for c in proprios if filtros.get(c) is None and f"filtros.{c}" not in out]
+    return out
+
+
 def verificar(baseline: dict | None, recomendacao_ficha: str | None, preco: float | None, moeda_preco: str | None,
               com_posicao: bool, tese: str | None = None, data_relatorio: str | None = None,
-              data_preco: str | None = None, hoje: str | None = None) -> dict:
+              data_preco: str | None = None, hoje: str | None = None, tipo_setor: str | None = None) -> dict:
     """
     Recalcula o veredicto pelas regras com o preço atual da app e compara com a Recomendação da Ficha.
     Precisa da linha «Cenários:» completa (bear, base, bull, moeda) e do preço; os filtros em falta ficam «não
-    verificável» um a um (não impedem o resto da verificação).
+    verificável» um a um (não impedem o resto da verificação). tipo_setor: ver tipo_setor() (regras por setor).
     """
     datas = texto_datas(data_relatorio, data_preco, hoje)
-    base = {"data_relatorio": data_relatorio, "data_preco": data_preco, "datas": datas, "limiares": LIMIARES}
-    faltam = list((baseline or {}).get("faltam") or [])
+    base = {"data_relatorio": data_relatorio, "data_preco": data_preco, "datas": datas, "limiares": LIMIARES,
+            "tipo_setor": tipo_setor}
+    faltam = faltam_do_setor(list((baseline or {}).get("faltam") or []), (baseline or {}).get("filtros"), tipo_setor)
     estado_b = (baseline or {}).get("estado", "ausente")
     if estado_b == "nao_reconhecido":
         return {**base, "estado": "nao_verificavel", "motivo": "formato de baseline não reconhecido", "faltam": faltam}
@@ -250,7 +309,7 @@ def verificar(baseline: dict | None, recomendacao_ficha: str | None, preco: floa
                 "motivo": f"moeda do preço ({moeda_preco}) diferente da dos cenários ({c['moeda']})"}
 
     cen = calcular_cenarios(c["bear"], c["base"], c["bull"], preco)
-    filtros = avaliar_filtros(f)
+    filtros = avaliar_filtros(f, tipo_setor)
     v = veredicto(filtros, cen, com_posicao, tese)
 
     # Coerência das contas do próprio relatório (com o preço do relatório, se ele o escrever)

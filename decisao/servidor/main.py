@@ -26,7 +26,10 @@ from fastapi.responses import FileResponse, HTMLResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 import calendario as CAL  # noqa: E402
+import candidatas as CA  # noqa: E402
 import compras as CP  # noqa: E402
+import contraprova as CT  # noqa: E402
+import diario as DI  # noqa: E402
 import por_decidir as PD  # noqa: E402
 import config  # noqa: E402
 import criterios_config as C  # noqa: E402
@@ -694,11 +697,12 @@ def valor_que_conta(ancora: str, conhecimento: dict, ref: dict, preco, moeda: st
 
 
 def verificacao_cowork(conhecimento: dict, preco, moeda: str | None, posicao: dict, tese: str | None,
-                       quando_preco: str | None, hoje: str | None = None) -> dict:
+                       quando_preco: str | None, hoje: str | None = None, tipo_setor: str | None = None) -> dict:
     """Regras do Cowork (regras_cowork.verificar) com o PREÇO ATUAL e a posição efetiva: veredicto, filtros
-    (passa / falha / não verificável), preços de entrada, aviso de divergência e as duas datas."""
+    (passa / falha / não verificável), preços de entrada, aviso de divergência e as duas datas. tipo_setor: bancos,
+    seguradoras e REIT têm a sua regra no lugar da de ROIC (regras_cowork.tipo_setor)."""
     hoje = hoje or date.today().isoformat()
-    extra = {"posicao": posicao, "recuo": False, "nota_cenarios": None}
+    extra = {"posicao": posicao, "recuo": False, "nota_cenarios": None, "tipo_setor": tipo_setor}
     if not conhecimento.get("n_relatorios"):
         return {**extra, "estado": "nao_verificavel", "motivo": SEM_RELATORIO, "faltam": [], "data_relatorio": None,
                 "data_preco": quando_preco, "datas": RC.texto_datas(None, quando_preco, hoje)}
@@ -707,7 +711,8 @@ def verificacao_cowork(conhecimento: dict, preco, moeda: str | None, posicao: di
         return {**extra, "estado": "nao_verificavel", "motivo": esc["motivo"], "faltam": ["linha Cenários"],
                 "data_relatorio": None, "data_preco": quando_preco, "datas": RC.texto_datas(None, quando_preco, hoje)}
     rec = (conhecimento.get("recomendacao") or {}).get("nivel")
-    v = RC.verificar(esc["baseline"], rec, preco, moeda, posicao["com_posicao"], tese, esc["data"], quando_preco, hoje)
+    v = RC.verificar(esc["baseline"], rec, preco, moeda, posicao["com_posicao"], tese, esc["data"], quando_preco, hoje,
+                     tipo_setor=tipo_setor)
     return {**v, **extra, "recuo": esc["recuo"], "nota_cenarios": esc["nota"], "relatorio_cenarios": esc["relatorio"]}
 
 
@@ -742,7 +747,19 @@ def bloco_decisao(t: str) -> dict:
     posicao = posicao_efetiva(lista, W.ler_notas(t).get("posicao"))
     regras_atuais = RG.ler()
     vq = valor_que_conta(regras_atuais["valor_ancora"], conhecimento, ref, preco, moeda_cot)
-    verificacao = verificacao_cowork(conhecimento, preco, moeda_cot, posicao, tese, (preco_info or {}).get("quando"))
+    tipo_setor = RC.tipo_setor((tri or {}).get("setor"), (tri or {}).get("industria"))
+    verificacao = verificacao_cowork(conhecimento, preco, moeda_cot, posicao, tese, (preco_info or {}).get("quando"),
+                                     tipo_setor=tipo_setor)
+    # Contraprova pelo DCF invertido: o crescimento que o preço atual e o cenário base do relatório assumem
+    esc = escolher_baseline(conhecimento) if conhecimento.get("n_relatorios") else {"baseline": None}
+    cen_rel = (esc["baseline"] or {}).get("cenarios") if verificacao.get("estado") == "verificado" else None
+    wacc_rel = ((esc["baseline"] or {}).get("filtros") or {}).get("wacc")
+    if fun and fun.get("apoio"):
+        contra = _tentar(CT.calcular, fun["apoio"], preco, F.dcf_invertido, F.pressupostos_dcf, wacc_rel,
+                         ((cen_rel or {}).get("base") or {}).get("valor"), (verificacao.get("cenarios") or {}).get("ponderado"),
+                         tipo_setor) or {"ok": False, "motivo": "erro no cálculo"}
+    else:
+        contra = {"ok": False, "motivo": "sem análise fundamental (dados do Yahoo)"}
     d = DEC.calcular(
         qualidade=(tri or {}).get("veredicto", {}).get("nivel"),
         preco=preco,
@@ -768,11 +785,16 @@ def bloco_decisao(t: str) -> dict:
     if vq.get("nota"):
         alertas.append(f"Valor que conta: {vq['nota']}.")
     alertas += [f"Contas do relatório: {x}." for x in verificacao.get("avisos_contas") or []]
+    if contra.get("alerta"):
+        alertas.append(f"Contraprova (DCF invertido): {contra['alerta']}")
     mediana_app = ref.get("mediana") if ref.get("ok") else None
-    return {
+    out = {
         "alertas": alertas,
         "comparacao": comp,
         "verificacao": verificacao,
+        "contraprova": contra,
+        "cenarios_relatorio": cen_rel,
+        "setor": (tri or {}).get("setor"), "industria": (tri or {}).get("industria"),
         "ticker": t, "data": date.today().isoformat(), "nome": (tri or {}).get("nome"), "preco": preco,
         "preco_info": preco_info,
         "negocio": (qual or {}).get("negocio"), "lista": lista, "posicao": posicao,
@@ -801,6 +823,124 @@ def bloco_decisao(t: str) -> dict:
             "tem_notas": bool(((_tentar(W.ler_notas, t) or {}).get("texto") or "").strip()),
         },
     }
+    _tentar(registar_decisao, t, out)  # resumo para as Candidatas e sinal para o Diário (um extra: não pode falhar a página)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Resumo de cada decisão (Candidatas) e diário dos sinais
+# ---------------------------------------------------------------------------
+_cadeado_resumos = threading.Lock()
+
+
+def _ficheiro_resumos() -> Path:
+    return config.pasta_dados() / "decisoes_resumo.json"
+
+
+def _ficheiro_diario() -> Path:
+    return config.pasta_dados() / "diario.json"
+
+
+def registar_decisao(t: str, out: dict) -> None:
+    """Guarda o resumo da decisão (decisoes_resumo.json) e, nas empresas da carteira e da observação, regista no diário
+    quando o sinal muda (diario.json)."""
+    agora = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+    res = limpo(CA.resumo_de(out, agora))
+    with _cadeado_resumos:
+        f = _ficheiro_resumos()
+        try:
+            todos = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            todos = {}
+        todos[t.upper()] = res
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(todos, ensure_ascii=False), encoding="utf-8")
+        d = out.get("decisao") or {}
+        if out.get("lista") in ("carteira", "observacao") and d.get("nivel"):
+            diario = DI.ler(_ficheiro_diario())
+            novo = DI.registar_sinal(diario, t.upper(), d["nivel"], res["mostrar"] or d.get("rotulo"), agora,
+                                     nome=out.get("nome"), lista=out.get("lista"), preco=res["preco"], moeda=res["moeda"],
+                                     origem="regras do Cowork" if d.get("origem_nivel") == "cowork" else "pontos dos pilares",
+                                     motivo=(d.get("cowork") or {}).get("motivo") or (d.get("travoes") or [None])[0])
+            if novo:
+                DI.gravar(_ficheiro_diario(), diario)
+
+
+@em_cache(6)
+def historico_total(t: str) -> dict:
+    """Fechos diários ajustados a dividendos (retorno total) dos últimos 2 anos, para o Diário. Pence passam a libras."""
+    import yfinance as yf
+
+    tk = yf.Ticker(t)
+    h = tk.history(period="2y", auto_adjust=True)
+    s = h["Close"].dropna() if h is not None and not h.empty else None
+    if s is None or s.empty:
+        raise ValueError("o Yahoo não devolveu preços")
+    try:
+        moeda = tk.fast_info["currency"]
+    except Exception:  # noqa: BLE001
+        moeda = None
+    if moeda == "GBp":
+        s, moeda = s / 100, "GBP"
+    return {"moeda": moeda, "serie": [(d.strftime("%Y-%m-%d"), float(v)) for d, v in s.items()]}
+
+
+def _benchmark() -> tuple[str, str]:
+    """O índice de referência escolhido na Carteira (BENCH:IWDA.AS → IWDA.AS); sem cópia, o MSCI World."""
+    d = (CP.ler_carteira() or {}).get("dados") or {}
+    chave = (d.get("config") or {}).get("benchmark") or f"BENCH:{DI.BENCHMARK_OMISSAO}"
+    nome = next((b.get("nome") for b in d.get("benchmarks") or [] if b.get("chave") == chave), None)
+    t = chave.split(":", 1)[-1]
+    return t, nome or t
+
+
+@app.get("/api/diario")
+def api_diario():
+    """Recomendações dos relatórios e sinais da app, cada uma com o desempenho em euros contra o índice da Carteira."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    indice = W.construir_indice()
+    rels = DI.entradas_relatorios(indice["empresas"], lambda e: W.relatorios_da_empresa(indice, e), W._ordem, W.nivel_recomendacao)
+    # relatórios sem uma recomendação que a app leia (formato antigo): não entram, e diz-se quantos são
+    todos = DI.entradas_relatorios(indice["empresas"], lambda e: W.relatorios_da_empresa(indice, e), W._ordem, lambda _: "MANTER")
+    sem_rec = sorted({e["relatorio"] for e in todos} - {e["relatorio"] for e in rels})
+    sinais = DI.ler(_ficheiro_diario()).get("sinais", [])
+    entradas = [{**e, "fonte": "relatorio"} for e in rels] + [{**e, "fonte": "sinal"} for e in sinais]
+    bench_t, bench_nome = _benchmark()
+    tickers = sorted({e["ticker"] for e in entradas} | {bench_t})
+
+    def um(x):
+        try:
+            return x, historico_total(x)
+        except Exception as e:  # noqa: BLE001
+            return x, {"serie": None, "erro": f"sem preços no Yahoo ({type(e).__name__})"}
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        series = dict(ex.map(um, tickers))
+    moedas = sorted({s.get("moeda") for s in series.values() if s.get("moeda") and s.get("moeda") != "EUR"})
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        fx = dict(ex.map(lambda m: (m, (_tentar(historico_total, f"{m}EUR=X") or {}).get("serie")), moedas))
+    bench = series.get(bench_t, {}).get("serie")
+    if not bench:
+        raise HTTPException(502, f"Sem preços do índice de referência ({bench_t}) no Yahoo.")
+    medidas = DI.desempenho(entradas, series, fx, bench, date.today().isoformat())
+    return limpo({"benchmark": {"ticker": bench_t, "nome": bench_nome, "ate": bench[-1][0]}, "entradas": medidas,
+                  "resumo": DI.resumir(medidas), "sinais_desde": sinais[0]["data"] if sinais else None,
+                  "relatorios_sem_recomendacao": sem_rec,
+                  "horizontes": [h for h, _ in DI.HORIZONTES]})
+
+
+@app.get("/api/candidatas")
+def api_candidatas():
+    """As empresas da carteira e da observação por retorno até ao valor ponderado, com os pesos e os avisos de
+    concentração da carteira (a partir do último cálculo da Decisão de cada uma)."""
+    try:
+        resumos = json.loads(_ficheiro_resumos().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        resumos = {}
+    pesos = CA.pesos_carteira(CP.ler_carteira(), CP.yahoo_da_folha)
+    return limpo({**CA.montar(resumos, _listas(), pesos, RC.LIMIARES, CP.OUTRA_COTACAO),
+                  "gerado": datetime.now().isoformat(timespec="minutes")})
 
 
 # ---------------------------------------------------------------------------

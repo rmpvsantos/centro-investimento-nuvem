@@ -126,7 +126,8 @@ TENDENCIAS_ROIC = {"ascendente": "ascendente", "estavel": "estável", "descenden
 
 def _roic(r: re.Match) -> dict:
     """«ROIC 13,0% (média 5a 1,4%; tendência 3a ascendente)». Dentro dos parênteses, separados por «;», os campos
-    OPCIONAIS «média 5a X%» e «tendência 3a ascendente|estável|descendente», por qualquer ordem. Outra coisa = erro."""
+    OPCIONAIS «média 5a X%» e «tendência 3a ascendente|estável|descendente», por qualquer ordem. Outra coisa = erro.
+    O ROE dos bancos e seguradoras («ROE 14% (média 5a 12%; tendência 3a estável)») lê-se da mesma maneira."""
     out = {"ttm": _num(r.group(1)) / 100, "media_5a": None, "tendencia_3a": None}
     for parte in [p.strip() for p in (r.group(2) or "").split(";") if p.strip()]:
         if m := re.fullmatch(rf"(?i)m[ée]dia\s*5\s*a(?:nos)?\s+({NUM})\s*%", parte):
@@ -151,7 +152,16 @@ CAMPOS_FILTROS = {
                    lambda r: next(x for x in RESULTADOS if _sem_acentos(x) == _sem_acentos(r.group(1)))),
     "roic": (rf"(?i)roic\s+({NUM})\s*%(?:\s*\(([^()]*)\))?", _roic),
     "wacc": (rf"(?i)wacc\s+({NUM})\s*%", lambda r: _num(r.group(1)) / 100),
+    # Só para bancos e seguradoras (o ROIC não mede estes negócios): ROE e custo do capital próprio
+    "roe": (rf"(?i)roe\s+({NUM})\s*%(?:\s*\(([^()]*)\))?", _roic),
+    "ke": (rf"(?i)(?:ke|custo do capital pr[óo]prio)\s+({NUM})\s*%", lambda r: _num(r.group(1)) / 100),
+    # Só para REIT: payout do AFFO e dívida líquida / EBITDA
+    "payout_affo": (rf"(?i)(?:payout\s+(?:do\s+)?affo|affo\s+payout)\s+({NUM})\s*%", lambda r: _num(r.group(1)) / 100),
+    "divida_ebitda": (rf"(?i)d[íi]vida(?:\s+l[íi]quida)?\s*/\s*ebitda\s+({NUM})\s*x?", lambda r: _num(r.group(1))),
 }
+# Campos da linha «Filtros:» que só existem nalguns setores: a falta deles não é lacuna (regras_cowork decide quais
+# conta para cada setor)
+OPCIONAIS_FILTROS = {"roe", "ke", "payout_affo", "divida_ebitda"}
 CAMPOS_CENARIOS = {
     **{c: (rf"(?i){c}\s+({NUM})(?:\s*(?:{MOEDA}))?\s*\(\s*({NUM})\s*%\s*\)",
            lambda r: {"valor": _num(r.group(1)), "prob": _num(r.group(2)) / 100}) for c in ("bear", "base", "bull")},
@@ -162,8 +172,9 @@ CAMPOS_CENARIOS = {
     "data": (r"(?i)data\s+(\d{2})/(\d{2})/(\d{4})", _data),  # OPCIONAL: data dos cenários
 }
 OPCIONAIS = {"data"}  # campos que podem faltar sem a linha deixar de ser verificável
-RE_LACUNA = re.compile(r"(?i)^(fosso|gest[ãa]o|governa[çc][ãa]o|resultados|roic|wacc|bear|base|bull|ponderado|pre[çc]o|"
-                       r"desconto ao ponderado|assimetria)\s*:?\s*lacuna$")
+RE_LACUNA = re.compile(r"(?i)^(fosso|gest[ãa]o|governa[çc][ãa]o|resultados|roic|wacc|roe|ke|custo do capital pr[óo]prio|"
+                       r"payout\s+(?:do\s+)?affo|affo\s+payout|d[íi]vida(?:\s+l[íi]quida)?\s*/\s*ebitda|"
+                       r"bear|base|bull|ponderado|pre[çc]o|desconto ao ponderado|assimetria)\s*:?\s*lacuna$")
 
 
 def _segmentos(conteudo: str) -> list[str]:
@@ -234,7 +245,7 @@ def ler_baseline(texto: str) -> dict:
                 cenarios[c]["moeda"] = moeda
     erros = [f"Filtros: «{e}»" for e in est_f] + [f"Cenários: «{e}»" for e in est_c]
     faltam = ([] if "filtros" in linhas else ["linha Filtros"]) + ([] if "cenarios" in linhas else ["linha Cenários"])
-    faltam += [f"filtros.{k}" for k, v in (filtros or {}).items() if v is None]
+    faltam += [f"filtros.{k}" for k, v in (filtros or {}).items() if v is None and k not in OPCIONAIS_FILTROS]
     faltam += [f"cenarios.{k}" for k, v in (cenarios or {}).items() if v is None and k not in OPCIONAIS]
     estado = "nao_reconhecido" if erros else "ok"
     return {"estado": estado, "filtros": filtros, "cenarios": cenarios, "faltam": faltam,
