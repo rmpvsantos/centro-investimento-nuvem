@@ -8,9 +8,10 @@ Candidatas e concentração da carteira (pedido do Rui a 18/10/2026).
    valor ponderado (ponderado ÷ preço − 1); depois as que falham um filtro; por fim as sem cenários válidos, sem lugar
    no ranking (sem cenários não há retorno esperado: não se adivinha).
 3. Concentração: pesos das tuas posições e setores, da cópia da Carteira (carteira_dados.json: quantidades dos
-   movimentos × preço em euros das cotações; setores da classificação que preenches na Carteira). O total é o investido
-   em ações e ETF (sem poupança, PPR e outros). Os ETF diversificados não contam para nenhum setor. Limites em
-   regras_cowork.LIMIARES (peso_max_posicao, peso_max_setor).
+   movimentos × preço em euros das cotações; setores da classificação que preenches na Carteira). Cada peso conta só
+   dentro do seu grupo (pedido do Rui a 18/10/2026): uma ação sobre o total investido em ações, um ETF sobre o total
+   investido em ETF; os setores e os avisos são só das ações. Limites em regras_cowork.LIMIARES (peso_max_posicao,
+   peso_max_setor).
 Funções puras (sem rede): testadas em testes/teste_candidatas.py.
 """
 from __future__ import annotations
@@ -81,16 +82,21 @@ def pesos_carteira(exportacao: dict | None, yahoo_da_folha) -> dict:
             continue
         posicoes.append({"folha": t, "yahoo": yahoo_da_folha(t), "nome": c.get("nome"), "tipo": c["tipo"],
                          "setor": (classif.get(t) or {}).get("setor") or "Por classificar", "valor": q * c["precoEur"]})
-    total = sum(p["valor"] for p in posicoes)
-    if total <= 0:
+    # Pedido do Rui (18/10/2026): cada peso conta só dentro do seu grupo — uma ação sobre o total investido em ações, um
+    # ETF sobre o total investido em ETF; os setores contam-se só nas ações
+    totais = {t: sum(p["valor"] for p in posicoes if p["tipo"] == t) for t in ("Ação", "ETF")}
+    if sum(totais.values()) <= 0:
         return {"ok": False, "motivo": "A cópia da Carteira não tem posições com preço."}
     setores = defaultdict(float)
     for p in posicoes:
-        p["peso"] = p["valor"] / total
-        setores[p["setor"]] += p["peso"]
-    return {"ok": True, "exportado": exportacao.get("exportado"), "total_eur": total,
+        p["peso"] = p["valor"] / totais[p["tipo"]]
+        if p["tipo"] == "Ação":
+            setores[p["setor"]] += p["peso"]
+    return {"ok": True, "exportado": exportacao.get("exportado"), "total_eur": totais["Ação"], "total_etf_eur": totais["ETF"],
             "posicoes": sorted(posicoes, key=lambda p: -p["valor"]),
             "setores": sorted(({"setor": s, "peso": w, "conta": s not in SEM_SETOR} for s, w in setores.items()), key=lambda x: -x["peso"]),
+            "etfs": sorted(({"folha": p["folha"], "nome": p["nome"], "setor": p["setor"], "peso": p["peso"]} for p in posicoes
+                            if p["tipo"] == "ETF"), key=lambda x: -x["peso"]),
             "sem_preco": sem_preco}
 
 
@@ -132,9 +138,9 @@ def montar(resumos: dict, listas: dict, pesos: dict, limiares: dict, outra_cotac
                      "contraprova": r.get("contraprova") or {}, "setor": setor, "peso": (pos or {}).get("peso"),
                      "peso_setor": peso_setor.get(setor) if setor else None, "avisos": []}
             if linha["peso"] is not None and linha["peso"] > lim_pos:
-                linha["avisos"].append(f"posição com {_pct(linha['peso'])} da carteira (aviso a partir de {_pct(lim_pos, 0)})")
+                linha["avisos"].append(f"posição com {_pct(linha['peso'])} das ações (aviso a partir de {_pct(lim_pos, 0)})")
             if linha["nivel"] in ("comprar", "acumular") and setor and setor not in SEM_SETOR and (linha["peso_setor"] or 0) > lim_set:
-                linha["avisos"].append(f"comprar aumenta {setor}, que já pesa {_pct(linha['peso_setor'])} (aviso a partir de {_pct(lim_set, 0)})")
+                linha["avisos"].append(f"comprar aumenta {setor}, que já pesa {_pct(linha['peso_setor'])} das ações (aviso a partir de {_pct(lim_set, 0)})")
             linhas.append(linha)
 
     def chave(l):
@@ -149,9 +155,9 @@ def montar(resumos: dict, listas: dict, pesos: dict, limiares: dict, outra_cotac
             l["lugar"] = pos
     avisos = []
     if pesos.get("ok"):
-        avisos += [f"{p['folha']} pesa {_pct(p['peso'])} da carteira (aviso a partir de {_pct(lim_pos, 0)})"
+        avisos += [f"{p['folha']} pesa {_pct(p['peso'])} das ações (aviso a partir de {_pct(lim_pos, 0)})"
                    for p in pesos["posicoes"] if p["tipo"] == "Ação" and p["peso"] > lim_pos]
-        avisos += [f"O setor {s['setor']} pesa {_pct(s['peso'])} (ações e ETF do setor; aviso a partir de {_pct(lim_set, 0)})"
+        avisos += [f"O setor {s['setor']} pesa {_pct(s['peso'])} das ações (aviso a partir de {_pct(lim_set, 0)})"
                    for s in pesos["setores"] if s["conta"] and s["peso"] > lim_set]
     return {"linhas": linhas, "carteira": pesos, "avisos": avisos,
             "limiares": {"peso_max_posicao": lim_pos, "peso_max_setor": lim_set}}

@@ -38,8 +38,8 @@ LIMIARES = {
     "roe_min": 0.10,           # bancos e seguradoras: ROE dos últimos 12 meses
     "payout_affo_max": 0.90,   # REIT: dividendos ÷ AFFO
     "divida_ebitda_max": 6.0,  # REIT: dívida líquida ÷ EBITDA
-    "peso_max_posicao": 0.15,  # carteira: peso de uma ação no total investido (ações e ETF) a partir do qual há aviso
-    "peso_max_setor": 0.35,    # carteira: peso de um setor (sem os ETF diversificados) a partir do qual há aviso
+    "peso_max_posicao": 0.15,  # carteira: peso de uma ação no total investido em ações a partir do qual há aviso
+    "peso_max_setor": 0.35,    # carteira: peso de um setor no total investido em ações a partir do qual há aviso
 }
 TIPOS_SETOR = {"banco": "banco", "seguradora": "seguradora", "reit": "REIT"}
 
