@@ -230,7 +230,14 @@ def sincronia_relatorios(lista: list[dict]) -> dict:
 
 
 def descarregar_relatorios() -> int:
-    lista = ligacao("trab_relatorios")
+    t0 = time.time()
+    r = ligacao("trab_relatorios", {"detalhe": True})
+    if isinstance(r, dict):  # ligação nova: diz o método e os tempos dela
+        lista = r["lista"]
+        registar(f"  lista dos relatórios: {time.time() - t0:.0f} s no total; na ligação {r.get('ms_lista', 0) / 1000:.0f} s "
+                 f"({r.get('metodo')}) + índice {r.get('ms_indice', 0) / 1000:.0f} s" + (f"; erro da API: {r['erro']}" if r.get("erro") else ""))
+    else:
+        lista = r
     cache = CACHE / "relatorios"
     cache.mkdir(parents=True, exist_ok=True)
     for x in lista:  # nome do ficheiro em cache: o identificador do Drive e a data da última alteração
@@ -259,7 +266,9 @@ def descarregar_relatorios() -> int:
         (PASTAS["relatorios"] / nome).mkdir(parents=True, exist_ok=True)
     registar(f"Relatórios: {len(lista)} ({len(falta)} descarregados agora).")
     global SINCRONIA
+    t1 = time.time()
     SINCRONIA = sincronia_relatorios(lista)
+    registar(f"  comparação com a lista do PC: {time.time() - t1:.0f} s")
     return len(lista)
 
 
