@@ -1168,7 +1168,35 @@ def pesquisa_opcoes():
             "filtros": [{"grupo": f[0], "chave": f[1], "rotulo": f[2], "padrao": f[5], "min": f[6], "max": f[7], "passo": f[8],
                          "ativo": f[9], "ajuda": f[10] if len(f) > 10 else ""} for f in filtros.FILTROS_YAHOO],
             "filtros_analise": [{"grupo": f[0], "chave": f[1], "rotulo": f[2], "padrao": f[5], "min": f[6], "max": f[7], "passo": f[8],
-                                 "ajuda": f[-1]} for f in filtros.FILTROS_ANALISE]}
+                                 "ajuda": f[-1]} for f in filtros.FILTROS_ANALISE],
+            **_opcoes_mediana(filtros)}
+
+
+def _opcoes_mediana(filtros) -> dict:
+    """Indústrias do screener do Yahoo por setor e as métricas que se podem comparar com a mediana (com o sentido)."""
+    pesq = _desc_mod("pesquisa")
+    try:
+        from yfinance.const import EQUITY_SCREENER_EQ_MAP
+        industrias = {s: sorted(v) for s, v in EQUITY_SCREENER_EQ_MAP.get("industry", {}).items()}
+    except Exception:  # noqa: BLE001
+        industrias = {}
+    return {"industrias": industrias, "grupos_mediana": pesq.GRUPOS_MEDIANA, "min_empresas_omissao": pesq.MIN_EMPRESAS_OMISSAO,
+            "metricas_mediana": [{"coluna": c, "grupo": g, "sentido": pesq.sentido(c), "ajuda": filtros.METRICAS.get(c, {}).get("ajuda", "")}
+                                 for c, g in pesq.METRICAS_MEDIANA]}
+
+
+@app.get("/api/pesquisas/medianas")
+def pesquisas_medianas():
+    """Da última procura de cada pesquisa com comparação à mediana: o grupo, as medianas e os valores de todas as
+    candidatas (a página recalcula na hora quando mudas as métricas ou a percentagem)."""
+    out = {}
+    auto = DESCOBERTA / "automaticas"
+    for f in sorted(auto.glob("*/medianas.json")) if auto.exists() else []:
+        try:
+            out[f.parent.name] = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return limpo(out)
 
 
 # ---------- As pesquisas guardadas do Rui (os critérios dele), as mesmas da Descoberta e do Agendador do Windows ----------
@@ -1181,6 +1209,10 @@ def pesquisas_lista():
         total, minimo = pesq.contagem(crit)
         textos = [pesq._texto_criterio(pesq._YAHOO[k], pesq._YAHOO[k][4], v) for k, v in (crit.get("yahoo") or {}).items() if k in pesq._YAHOO]
         textos += [t for t, _f in pesq._criterios_depois(crit)]
+        if pesq.metricas_mediana(crit):
+            m = crit["mediana"]
+            alvo = (m.get("industria") or "").replace("—", " - ") or "setor " + str(m.get("setor"))
+            textos += [f"{c} melhor do que a mediana" for c in pesq.metricas_mediana(crit)] + [f"mediana: {alvo}, {pesq.GRUPOS_MEDIANA.get(m.get('grupo'), '')}"]
         out.append(limpo({**p, "descricao": pesq.descricao(crit), "criterios_texto": textos, "total_criterios": total, "minimo_criterios": minimo,
                           "agendamento": auto.agendamento(p["id"]), "registo": _registo_auto(p["id"])}))
     return out

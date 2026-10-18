@@ -97,9 +97,10 @@ def _cambio_para(moeda: str) -> float:
 
 
 def listar_universo(regioes: list[str], mcap_min_usd: float = 2e9, condicoes: list[tuple] | None = None,
-                    setores: list[str] | None = None, progresso=None) -> pd.DataFrame:
+                    setores: list[str] | None = None, progresso=None, industrias: list[str] | None = None) -> pd.DataFrame:
     """condicoes = [(campo do Yahoo, 'gt' | 'lt' | 'btwn', valor)]; 'btwn' significa entre 0 e o valor.
-    setores = nomes do Yahoo (ver filtros.SETORES); vazio = todos."""
+    setores = nomes do Yahoo (ver filtros.SETORES); vazio = todos. industrias = nomes do screener do Yahoo
+    (yfinance.const.EQUITY_SCREENER_EQ_MAP["industry"], ex.: «Software—Infrastructure»); vazio = todas."""
     import yfinance as yf
     from yfinance import EquityQuery as Q
 
@@ -115,6 +116,8 @@ def listar_universo(regioes: list[str], mcap_min_usd: float = 2e9, condicoes: li
                    Q("gt", ["intradaymarketcap", mcap_min_usd * cambio * FATOR_LIMITE_SCREENER.get(reg, 1)])]
         if setores:
             filtros.append(Q("is-in", ["sector", *setores]) if len(setores) > 1 else Q("eq", ["sector", setores[0]]))
+        if industrias:
+            filtros.append(Q("is-in", ["industry", *industrias]) if len(industrias) > 1 else Q("eq", ["industry", industrias[0]]))
         for campo, operador, valor in condicoes or []:
             filtros.append(Q("btwn", [campo, 0, valor]) if operador == "btwn" else Q(operador, [campo, valor]))
         consulta = Q("and", filtros)
