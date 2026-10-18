@@ -1102,10 +1102,10 @@ def pesquisa_criterios(ticker: str):
     base = aparece([])
     saida = {"ticker": t, "bolsa": bolsa, "regiao": uni.REGIOES[reg][0] if reg else None, "pais": linha.get("País"),
              "no_screener": base, "pesquisas": [], "gerado": datetime.now().strftime("%d/%m/%Y %H:%M")}
+    resultados = pesquisas_resultados()
     for p in auto.listar():
-        crit = p.get("criterios") or {}
-        regioes = crit.get("regioes") or []
-        total, minimo = pesq.contagem(crit)
+        crit = pesq.normalizar(p.get("criterios"))
+        regioes = pesq.AREAS[crit["area"]][1]
         universo = [
             {"texto": "Bolsa numa das regiões da pesquisa", "cumpre": (reg in regioes) if reg else None,
              "detalhe": f"{bolsa or '?'} ({saida['regiao'] or 'região não reconhecida'})"},
@@ -1121,20 +1121,29 @@ def pesquisa_criterios(ticker: str):
                              "detalhe": f"{mcap_usd / 1e6:,.0f} M USD".replace(",", ".") if mcap_usd else "lacuna"})
         except Exception:  # noqa: BLE001
             universo.append({"texto": "Capitalização mínima", "cumpre": None, "detalhe": "sem câmbio"})
-        ys = [(k, pesq._YAHOO[k], v) for k, v in (crit.get("yahoo") or {}).items() if k in pesq._YAHOO]
-        if base:
-            with ThreadPoolExecutor(max_workers=4) as ex:
-                res_y = list(ex.map(lambda x: aparece([(x[1][3], x[1][4], x[2])]), ys))
-        else:
-            res_y = [None] * len(ys)
-        criterios = [{"texto": pesq._texto_criterio(f, f[4], v), "cumpre": ok_, "origem": "Yahoo (screener)"} for (k, f, v), ok_ in zip(ys, res_y)]
-        criterios += [{"texto": texto, "cumpre": bool(f(linha)), "origem": "motor da Descoberta"} for texto, f in pesq._criterios_depois(crit)]
+        filtros_mod = _desc_mod("filtros")
+        if crit.get("setor"):
+            setor_pt = filtros_mod.SETORES.get(crit["setor"], crit["setor"])
+            universo.append({"texto": f"Setor: {setor_pt}", "cumpre": linha.get("Setor") == setor_pt if linha.get("Setor") else None,
+                             "detalhe": linha.get("Setor") or "lacuna"})
+        if crit.get("industria"):
+            universo.append({"texto": f"Indústria: {crit['industria'].replace('—', ' - ')}",
+                             "cumpre": pesq.mesma_industria(crit["industria"], linha.get("Indústria")) if linha.get("Indústria") else None,
+                             "detalhe": linha.get("Indústria") or "lacuna"})
+        # Critérios com os valores do motor; os pela mediana usam as medianas do grupo da empresa na última procura
+        res = resultados.get(p["id"]) or {}
+        grupo = (res.get("grupos") or {}).get(str(linha.get(res.get("coluna_grupo") or "Setor")))
+        aval = pesq.avaliar(pesq._valores(linha), grupo, pesq.criterios_ativos(crit), float(crit.get("limiar", 0.8)))
+        criterios = [{"texto": x["texto"] if x["cumpre"] is not None else x["texto"] + " (sem mediana do grupo na última procura)",
+                      "cumpre": x["cumpre"], "origem": "motor da Descoberta" + (" · mediana da última procura" if x["modo"] == "mediana" else "")}
+                     for x in aval["criterios"]]
+        total, minimo = aval["total"], aval["minimo"]
         cumpridos = sum(1 for c in criterios if c["cumpre"])
         por_ver = sum(1 for c in criterios if c["cumpre"] is None)
         falhados = sum(1 for c in criterios if c["cumpre"] is False)
         if any(u["cumpre"] is False for u in universo) or falhados > total - minimo:
             passaria = False
-        elif por_ver or any(u["cumpre"] is None for u in universo):
+        elif any(u["cumpre"] is None for u in universo):
             passaria = None  # sem todos os dados não se pode dizer que passa
         else:
             passaria = True
@@ -1173,30 +1182,49 @@ def pesquisa_opcoes():
 
 
 def _opcoes_mediana(filtros) -> dict:
-    """Indústrias do screener do Yahoo por setor e as métricas que se podem comparar com a mediana (com o sentido)."""
+    """Formato 2 das pesquisas: áreas, indústrias do screener do Yahoo por setor e o catálogo de critérios (com o
+    sentido, o formato e o limite por omissão de cada um)."""
     pesq = _desc_mod("pesquisa")
     try:
         from yfinance.const import EQUITY_SCREENER_EQ_MAP
         industrias = {s: sorted(v) for s, v in EQUITY_SCREENER_EQ_MAP.get("industry", {}).items()}
     except Exception:  # noqa: BLE001
         industrias = {}
-    return {"industrias": industrias, "grupos_mediana": pesq.GRUPOS_MEDIANA, "min_empresas_omissao": pesq.MIN_EMPRESAS_OMISSAO,
-            "metricas_mediana": [{"coluna": c, "grupo": g, "sentido": pesq.sentido(c), "ajuda": filtros.METRICAS.get(c, {}).get("ajuda", "")}
-                                 for c, g in pesq.METRICAS_MEDIANA]}
+    return {"areas": {k: v[0] for k, v in pesq.AREAS.items()}, "industrias": industrias, "grupos_mediana": pesq.GRUPOS_MEDIANA,
+            "min_empresas_omissao": pesq.MIN_EMPRESAS_OMISSAO, "grupos_criterios": pesq.GRUPOS_CRITERIOS,
+            "catalogo": [{"chave": k, "rotulo": r, "grupo": g, "coluna": col, "sentido": s, "fmt": f, "padrao": pad, "passo": passo,
+                          "ajuda": aj, "so_limite": k in pesq.SO_LIMITE, "so_positivo": k in pesq.SO_POSITIVOS}
+                         for k, r, g, col, s, f, pad, passo, aj in pesq.CATALOGO]}
 
 
-@app.get("/api/pesquisas/medianas")
-def pesquisas_medianas():
-    """Da última procura de cada pesquisa com comparação à mediana: o grupo, as medianas e os valores de todas as
-    candidatas (a página recalcula na hora quando mudas as métricas ou a percentagem)."""
+@app.get("/api/pesquisas/resultados")
+def pesquisas_resultados():
+    """Da última procura de cada pesquisa guardada: os valores de todas as empresas analisadas e as medianas de cada
+    grupo (setor ou indústria). A página recalcula na hora quando mudas os critérios, os modos ou a percentagem."""
     out = {}
     auto = DESCOBERTA / "automaticas"
-    for f in sorted(auto.glob("*/medianas.json")) if auto.exists() else []:
+    ids = {p["id"] for p in _desc_mod("automatico").listar()}
+    for f in sorted(auto.glob("*/resultado.json")) if auto.exists() else []:
+        if f.parent.name not in ids:
+            continue  # pesquisa apagada
         try:
             out[f.parent.name] = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
     return limpo(out)
+
+
+@app.delete("/api/pesquisas/{ident}")
+def pesquisa_apagar(ident: str):
+    """Apaga uma pesquisa guardada (os critérios e os resultados dela). As outras não mudam."""
+    import shutil
+    auto = _desc_mod("automatico")
+    if not re.fullmatch(r"[a-z0-9\-]+", ident) or not auto.carregar(ident):
+        raise HTTPException(404, "Pesquisa não encontrada.")
+    auto.apagar(ident)
+    shutil.rmtree(DESCOBERTA / "automaticas" / ident, ignore_errors=True)
+    _cache.pop("descoberta", None)
+    return {"ok": True}
 
 
 # ---------- As pesquisas guardadas do Rui (os critérios dele), as mesmas da Descoberta e do Agendador do Windows ----------
@@ -1205,15 +1233,10 @@ def pesquisas_lista():
     auto, pesq = _desc_mod("automatico"), _desc_mod("pesquisa")
     out = []
     for p in auto.listar():
-        crit = p.get("criterios") or {}
-        total, minimo = pesq.contagem(crit)
-        textos = [pesq._texto_criterio(pesq._YAHOO[k], pesq._YAHOO[k][4], v) for k, v in (crit.get("yahoo") or {}).items() if k in pesq._YAHOO]
-        textos += [t for t, _f in pesq._criterios_depois(crit)]
-        if pesq.metricas_mediana(crit):
-            m = crit["mediana"]
-            alvo = (m.get("industria") or "").replace("—", " - ") or "setor " + str(m.get("setor"))
-            textos += [f"{c} melhor do que a mediana" for c in pesq.metricas_mediana(crit)] + [f"mediana: {alvo}, {pesq.GRUPOS_MEDIANA.get(m.get('grupo'), '')}"]
-        out.append(limpo({**p, "descricao": pesq.descricao(crit), "criterios_texto": textos, "total_criterios": total, "minimo_criterios": minimo,
+        crit = pesq.normalizar(p.get("criterios"))  # as antigas aparecem já no formato 2 (gravam-se assim ao editar)
+        total, minimo = pesq.contagem_v2(crit)
+        textos = [pesq.texto_criterio_v2(k, m, lim) for k, m, lim in pesq.criterios_ativos(crit)]
+        out.append(limpo({**p, "criterios": crit, "descricao": pesq.descricao_v2(crit), "criterios_texto": textos, "total_criterios": total, "minimo_criterios": minimo,
                           "agendamento": auto.agendamento(p["id"]), "registo": _registo_auto(p["id"])}))
     return out
 
@@ -1250,14 +1273,19 @@ def empresa(ticker: str):
 @app.put("/api/pesquisas/{ident}")
 def pesquisa_guardar(ident: str, corpo: dict = Body(...)):
     """Grava os critérios no mesmo ficheiro da Descoberta (pesquisas/<id>.json): as duas apps e o Agendador usam-nos."""
-    auto = _desc_mod("automatico")
+    auto, pesq = _desc_mod("automatico"), _desc_mod("pesquisa")
     nome = str(corpo.get("nome") or "").strip()
     crit = corpo.get("criterios")
-    if not nome or not isinstance(crit, dict) or not crit.get("regioes"):
-        raise HTTPException(400, "Falta o nome, as regiões ou os critérios.")
+    if not nome or not isinstance(crit, dict):
+        raise HTTPException(400, "Falta o nome ou os critérios.")
+    crit = pesq.normalizar(crit)
+    if crit.get("area") not in pesq.AREAS:
+        raise HTTPException(400, "Escolhe a área: EUA e Canadá ou Europa.")
     if ident != "nova" and auto.identificador(nome) != ident:
-        raise HTTPException(400, "Para mudar o nome, cria uma pesquisa nova (o nome é o identificador da tarefa agendada).")
-    novo = auto.guardar(nome, crit, list(corpo.get("alertar") or []))
+        raise HTTPException(400, "Para mudar o nome, cria uma pesquisa nova (o nome é o identificador da pesquisa).")
+    if ident == "nova" and auto.carregar(auto.identificador(nome)):
+        raise HTTPException(409, f"Já existe uma pesquisa com o nome «{nome}». Escolhe outro nome.")
+    novo = auto.guardar(nome, crit, list(corpo.get("alertar") or ["Bom negócio a preço atrativo", "Bom negócio, mas caro"]))
     return {"id": novo}
 
 

@@ -120,13 +120,12 @@ def correr(ident: str, progresso=None, notificar: bool = True) -> dict:
     resumo = {"quando": agora.isoformat(timespec="minutes"), "universo": r["universo"],
               "analisadas": r["analisadas"], "passaram": len(df), "em_alerta": len(atuais),
               "novas": novas, "sairam": sairam, "falhas": len(r["falhas"]), "relatorio": str(relatorio)}
-    # Comparação com a mediana: medianas e valores de todas as candidatas (a página da Pesquisa recalcula na hora)
-    med_f = pasta / "medianas.json"
-    if r.get("mediana"):
-        med_f.write_text(json.dumps(r["mediana"], ensure_ascii=False, default=str), encoding="utf-8")
-        resumo["mediana"] = {k: r["mediana"].get(k) for k in ("nivel", "industria", "setor", "grupo_texto", "n_pares", "nota")}
-    else:
-        med_f.unlink(missing_ok=True)
+    # Valores de todas as analisadas e medianas de cada grupo (a página da Pesquisa recalcula na hora quando se mudam
+    # os critérios, sem nova procura)
+    (pasta / "medianas.json").unlink(missing_ok=True)  # ficheiro da 1.ª versão (substituído por resultado.json)
+    if r.get("resultado"):
+        (pasta / "resultado.json").write_text(json.dumps(r["resultado"], ensure_ascii=False, default=str), encoding="utf-8")
+        resumo["nota"] = r["resultado"].get("nota")
     _atualizar_ultima(ident, resumo)
     if notificar and novas:
         nomes = ", ".join(novas[:6]) + ("..." if len(novas) > 6 else "")
@@ -191,19 +190,8 @@ def _escrever_relatorio(reg, r, classes, novas, sairam, primeira, destino: Path)
                  + (f"<b>Saíram:</b> {e(', '.join(sairam))}." if sairam else "") + "</div>")
     else:
         caixa = "<div class='caixa'>Sem alterações face à execução anterior.</div>"
-    med = r.get("mediana")
-    bloco_med = ""
-    if med:
-        def v(m):
-            if m["mediana"] is None:
-                return "sem mediana"
-            return (f"{m['mediana'] * 100:.1f}%" if m["fmt"] in ("pct", "pct0", "pp") else f"{m['mediana']:.1f}").replace(".", ",")
-        alvo = (med.get("industria") or "").replace("—", " - ") if med["nivel"] == "industria" else f"setor {med.get('setor')}"
-        bloco_med = (f"<h2>Medianas ({e(alvo)}, {e(med['grupo_texto'])}, {med['n_pares']} empresas)</h2>"
-                     + (f"<div class='caixa'>{e(med['nota'])}</div>" if med.get("nota") else "")
-                     + "<table><tr><th>Métrica</th><th>Melhor se</th><th>Mediana</th><th>Empresas com valor</th></tr>"
-                     + "".join(f"<tr><td>{e(m['coluna'])}</td><td>{m['sentido']} da mediana</td><td class='n'>{v(m)}</td>"
-                               f"<td class='n'>{m['n']}</td></tr>" for m in med["medianas"]) + "</table>")
+    nota_res = (r.get("resultado") or {}).get("nota")
+    bloco_med = f"<div class='caixa'>{e(nota_res)}</div>" if nota_res else ""
     agora = datetime.now()
     conteudo = f"""<!doctype html><html lang="pt-PT"><head><meta charset="utf-8">
 <title>{e(reg['nome'])} · {agora:%d/%m/%Y}</title><style>{_CSS}</style></head><body><main>
@@ -221,7 +209,7 @@ def _escrever_relatorio(reg, r, classes, novas, sairam, primeira, destino: Path)
 {tabela}
 {bloco_med}
 <h2>Critérios</h2>
-<p class="sub">{e(descricao(reg['criterios']))}</p>
+<p class="sub">{e(r.get('descricao') or descricao(reg['criterios']))}</p>
 <p class="nota">Gerado pela app Descoberta de Ações com dados do Yahoo Finance. É uma triagem, não uma recomendação
 de investimento: confirma sempre nos relatórios da empresa antes de decidir. {len(r['falhas'])} empresa(s) sem análise.</p>
 </main></body></html>"""

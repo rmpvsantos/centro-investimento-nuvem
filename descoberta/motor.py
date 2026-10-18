@@ -107,4 +107,58 @@ def linha_resumo(a: dict) -> dict:
         "Altman Z": _num(qual["altman"].get("valor")),
         "Capitalização (mil milhões)": _num(mcap / 1e9) if _num(mcap) else None,
         "Moeda das contas": res.get("moeda"),
+        **_indicadores_pesquisa(res, a, financeira),
+    }
+
+
+def _mediana(s) -> float | None:
+    s = s.replace([math.inf, -math.inf], float("nan")).dropna()
+    return _num(s.median()) if len(s) else None
+
+
+def _ultimo(s) -> float | None:
+    s = s.dropna()
+    return _num(s.iloc[-1]) if len(s) else None
+
+
+def _div(a, b, so_positivo_b: bool = True) -> float | None:
+    a, b = _num(a), _num(b)
+    if a is None or b is None or b == 0 or (so_positivo_b and b < 0):
+        return None
+    return _num(a / b)
+
+
+def _indicadores_pesquisa(res: dict, a: dict, financeira: bool) -> dict:
+    """Os critérios da Pesquisa (pedido do Rui a 18/10/2026) que o resumo ainda não tinha. Rácios de balanço e de
+    resultados com os exercícios anuais (medianas onde a série tem vários anos) e os valores atuais; os da avaliação
+    com a capitalização atual. Nas financeiras (bancos, seguradoras) o que não se aplica fica vazio."""
+    tab, at, ind = res["anual"], res["atual"], res.get("indicadores_yahoo") or {}
+    mcap, nd = res.get("capitalizacao_fin"), at.get("divida_liquida")
+    ebitda_at, fcf_at, cp = at.get("ebitda"), at.get("fcf"), at.get("capital_proprio")
+    capital_empregue = tab["ativo_total"] - tab["passivo_corrente"]
+    div_ult, luc_ult = _ultimo(tab["dividendos"]), _ultimo(tab["lucro_liquido"])
+    nivel_moat = {"largo": 2, "estreito": 1, "sem": 0}.get(a["moat"].get("classe"))
+    return {
+        "Crescimento EPS (CAGR)": _num(cagr(tab["eps"])),
+        "Crescimento FCF (CAGR)": None if financeira else _num(cagr(tab["fcf"])),
+        "Crescimento EBITDA (CAGR)": None if financeira else _num(cagr(tab["ebitda"])),
+        "Capex (% receitas)": None if financeira else _mediana(tab["capex_receita"]),
+        "Margem líquida mediana": _mediana(tab["lucro_liquido"] / tab["receita"]),
+        "Margem EBITDA mediana": None if financeira else _mediana(tab["margem_ebitda"]),
+        "Rotação do ativo": _mediana(tab["receita"] / tab["ativo_total"]),
+        "ROA mediano": _mediana(tab["lucro_liquido"] / tab["ativo_total"]),
+        "ROCE mediano": None if financeira else _mediana(tab["ebit"] / capital_empregue.where(capital_empregue > 0)),
+        "Caixa líquida (% capitalização)": None if financeira else _div(-nd if _num(nd) is not None else None, mcap),
+        "Dívida líquida/Capital próprio": None if financeira else _div(nd, cp),
+        "Dívida líquida/FCF": None if financeira else _div(nd, fcf_at),
+        "Liquidez corrente": None if financeira else _ultimo(tab["ativo_corrente"] / tab["passivo_corrente"]),
+        "Quick ratio": None if financeira else _num(ind.get("quick_ratio")),
+        "P/E futuro": _num(ind.get("pe_futuro")),
+        "PEG": _num(ind.get("peg")),
+        "P/B": _num(ind.get("p_b")),
+        "EV/EBITDA": None if financeira else _div(res.get("ev_atual"), ebitda_at),
+        "Payout": _div(div_ult, luc_ult),
+        "SBC (% receitas)": _mediana(tab["sbc_receita"]),
+        "Dividend yield": _div(div_ult, mcap) if div_ult is not None else 0.0,
+        "Moat (nível)": nivel_moat,
     }

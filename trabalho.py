@@ -65,7 +65,7 @@ VISTOS = PASTAS["centro_dados"] / "vistos_nuvem.json"  # empresas abertas na app
 # O que as páginas mostram sem ser de uma empresa
 GLOBAIS_D = ["/api/indice", "/api/listas", "/api/por_decidir", "/api/regras", "/api/calendario", "/api/relatorios-em-falta",
              "/api/transferencias", "/api/noticias/recentes?dias=2", "/api/pesquisa?q=&ocultos=false"]
-GLOBAIS_C = ["/api/decisao/resumo", "/api/descoberta", "/api/pesquisas", "/api/pesquisas/medianas", "/api/pesquisa/opcoes",
+GLOBAIS_C = ["/api/decisao/resumo", "/api/descoberta", "/api/pesquisas", "/api/pesquisas/resultados", "/api/pesquisa/opcoes",
              "/api/cowork/pedidos", "/api/decisao/por_decidir", "/api/estado"]
 # Por empresa (a ordem conta: a decisão aquece as caches de tudo o resto)
 EMPRESA_D = ["decisao", "triagem", "fundamental", "tecnica", "qualitativa", "noticias"]

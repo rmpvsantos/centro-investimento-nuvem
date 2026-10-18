@@ -545,4 +545,7 @@ def analisar(dados: dict) -> dict:
         "crescimento_analistas": dados.get("crescimento_analistas") or {},
         "extras": extras,
         "avisos": avisos,
+        # Indicadores que o Yahoo dá já calculados (critérios da Pesquisa: P/E futuro, PEG, P/B, quick ratio)
+        "indicadores_yahoo": {"pe_futuro": info.get("forwardPE"), "peg": info.get("trailingPegRatio") or info.get("pegRatio"),
+                              "p_b": info.get("priceToBook"), "quick_ratio": info.get("quickRatio")},
     }
