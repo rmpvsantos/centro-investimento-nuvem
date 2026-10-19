@@ -282,6 +282,11 @@ MIN_EMPRESAS_OMISSAO = 15                  # abaixo disto, a mediana da indústr
 MIN_VALORES_METRICA = 5                    # menos valores do que isto num grupo: sem mediana (o critério não conta)
 GRUPOS_MEDIANA = {"regiao": "a mesma área da pesquisa", "eua_europa": "EUA, Canadá e Europa juntos"}
 MODOS = ("limite", "mediana")
+# Desde 19/10/2026 (pedido do Rui): a pesquisa toda é por um só método — «mediana» (cada critério tem de ser melhor do que a
+# mediana da indústria da própria empresa) ou «limite» (os limites dele) —, com vários setores e indústrias, e mostra as
+# TOP_OMISSAO melhores (ordenadas por critérios cumpridos e, no empate, pela folga média face à referência).
+METODOS = {"mediana": "Melhor que a mediana da indústria", "limite": "Os meus limites"}
+TOP_OMISSAO = 15
 
 
 def escala(chave: str) -> float:
@@ -310,7 +315,7 @@ def normalizar(crit: dict | None) -> dict:
     equivalente passa a critério «limite» com o mesmo valor; os que não têm equivalente ficam em «nao_convertidos»."""
     crit = dict(crit or {})
     if crit.get("versao") == VERSAO:
-        return crit
+        return _completar_v2(crit)
     mapa_y = {"roic": "roic", "margem_bruta": "margem_bruta", "margem_liquida": "margem_liquida", "margem_ebitda": "margem_ebitda",
               "divida": "nd_ebitda", "cobertura": "cobertura", "liquidez": "liquidez_corrente", "altman": "altman",
               "cresc_receitas": "cresc_receitas", "cresc_eps": "cresc_eps", "cresc_fcf": "cresc_fcf", "pe": "pe", "peg": "peg",
@@ -328,27 +333,45 @@ def normalizar(crit: dict | None) -> dict:
         criterios["moat"] = {"modo": "limite", "valor": 1}
     if crit.get("moat_tipos"):
         fora.append("moat_tipos")
-    setores = crit.get("setores") or []
-    return {"versao": VERSAO, "area": area_das_regioes(crit.get("regioes")), "setor": setores[0] if len(setores) == 1 else "",
-            "industria": "", "mcap": crit.get("mcap", 5000), "limite": crit.get("limite", 200), "ordem": crit.get("ordem") or ORDENS[0],
+    return {"versao": VERSAO, "area": area_das_regioes(crit.get("regioes")), "setores": list(crit.get("setores") or []),
+            "industrias": [], "metodo": "limite", "top": TOP_OMISSAO,
+            "mcap": crit.get("mcap", 5000), "limite": crit.get("limite", 200), "ordem": crit.get("ordem") or ORDENS[0],
             "criterios": criterios, "limiar": crit.get("limiar", LIMIAR_POR_OMISSAO), "grupo_mediana": "regiao",
             "min_empresas": MIN_EMPRESAS_OMISSAO, "parametros": crit.get("parametros") or asdict(Parametros()),
             "nao_convertidos": fora}
 
 
+def _completar_v2(c: dict) -> dict:
+    """Formato 2 de 18/10/2026 (um setor, uma indústria, modo critério a critério) → o de 19/10/2026: listas de setores e
+    indústrias e um só método (o da maioria dos critérios: «mediana» se algum o usava, como o Rui passou a querer)."""
+    if "setores" not in c:
+        c["setores"] = [c["setor"]] if c.get("setor") else []
+    if "industrias" not in c:
+        c["industrias"] = [c["industria"]] if c.get("industria") else []
+    c.pop("setor", None)
+    c.pop("industria", None)
+    if c.get("metodo") not in METODOS:
+        c["metodo"] = "mediana" if any((v or {}).get("modo") == "mediana" for v in (c.get("criterios") or {}).values()) else "limite"
+    if not isinstance(c.get("top"), int) or c["top"] < 0:
+        c["top"] = TOP_OMISSAO
+    return c
+
+
 def criterios_ativos(crit: dict) -> list[tuple[str, str, float | None]]:
-    """[(chave, modo, limite na escala da coluna ou None na mediana)] dos critérios escolhidos e válidos."""
+    """[(chave, modo, limite na escala da coluna ou None na mediana)] dos critérios escolhidos e válidos. O modo é o método
+    da pesquisa; o moat (classe, não número) vai sempre pelo limite."""
+    c = normalizar(crit)
     out = []
-    for k, c in (normalizar(crit).get("criterios") or {}).items():
+    for k, v in (c.get("criterios") or {}).items():
         if k not in _CAT:
             continue
-        modo = c.get("modo") if c.get("modo") in MODOS else "limite"
+        modo = c["metodo"]
         if modo == "mediana" and k in SO_LIMITE:
             modo = "limite"
         if modo == "limite":
-            if not _num_ok("x", c.get("valor")):
+            if not _num_ok("x", (v or {}).get("valor")):
                 continue
-            out.append((k, modo, float(c["valor"]) * escala(k)))
+            out.append((k, modo, float(v["valor"]) * escala(k)))
         else:
             out.append((k, modo, None))
     return out
@@ -406,15 +429,33 @@ def calcular_grupos(pares: pd.DataFrame, coluna_grupo: str) -> dict:
 
 def avaliar(valores: dict, grupo: dict | None, ativos: list[tuple], limiar: float) -> dict:
     """Uma empresa: cada critério (cumpre / falha / sem mediana), quantos contam, quantos cumpre e se passa."""
-    linhas = []
+    linhas, folgas = [], []
     for k, modo, lim in ativos:
         med = ((grupo or {}).get("medianas") or {}).get(k, {}).get("mediana") if modo == "mediana" else None
         ok = cumpre(k, modo, valores.get(k), lim, med)
         linhas.append({"chave": k, "modo": modo, "cumpre": ok, "texto": texto_criterio_v2(k, modo, lim, med)})
+        if ok is not None:
+            folgas.append(folga(k, valores.get(k), lim if modo == "limite" else med))
     contam = [x for x in linhas if x["cumpre"] is not None]
     total, n_ok = len(contam), sum(1 for x in contam if x["cumpre"])
     minimo = math.ceil(limiar * total - 1e-9) if total else 0
-    return {"criterios": linhas, "total": total, "cumpre": n_ok, "minimo": minimo, "passa": total > 0 and n_ok >= minimo}
+    return {"criterios": linhas, "total": total, "cumpre": n_ok, "minimo": minimo, "passa": total > 0 and n_ok >= minimo,
+            "folga": sum(folgas) / len(folgas) if folgas else None}
+
+
+def folga(chave: str, valor, ref: float) -> float:
+    """Quanto melhor do que a referência (mediana ou limite), em fração dela, limitado a ±1 (100%): só desempata empresas
+    com o mesmo número de critérios cumpridos. Sem valor = −1 (o pior)."""
+    if not _num_ok(chave, valor):
+        return -1.0
+    d = (float(valor) - ref) if _CAT[chave][4] == "acima" else (ref - float(valor))
+    return max(-1.0, min(1.0, d / abs(ref))) if ref else (1.0 if d > 0 else -1.0 if d < 0 else 0.0)
+
+
+def chave_ordem(a: dict, ticker: str = "") -> tuple:
+    """As melhores primeiro: passa; percentagem de critérios cumpridos; número cumprido; folga média. (O mesmo que a página.)"""
+    total = a["total"] or 1
+    return (not a["passa"], -a["cumpre"] / total, -a["cumpre"], -(a["folga"] if a["folga"] is not None else -1.0), ticker)
 
 
 def contagem_v2(crit: dict) -> tuple[int, int]:
@@ -425,16 +466,52 @@ def contagem_v2(crit: dict) -> tuple[int, int]:
 def descricao_v2(crit: dict) -> str:
     c = normalizar(crit)
     partes = [AREAS.get(c.get("area"), AREAS["eua_canada"])[0],
-              SETORES.get(c.get("setor"), c.get("setor")) if c.get("setor") else "todos os setores",
-              (c.get("industria") or "").replace("—", " - ") or "todas as indústrias",
+              ", ".join(SETORES.get(s, s) for s in c["setores"]) or "todos os setores",
+              ", ".join(i.replace("—", " - ") for i in c["industrias"]) or "todas as indústrias",
               f"capitalização ≥ {c.get('mcap', 0):,.0f} M USD".replace(",", ".")]
     partes += [texto_criterio_v2(k, m, lim) for k, m, lim in criterios_ativos(c)]
     total, minimo = contagem_v2(c)
     if total:
         partes.append(f"cumprir pelo menos {minimo} de {total} critérios ({float(c.get('limiar', 1)):.0%})")
     if any(m == "mediana" for _k, m, _l in criterios_ativos(c)):
-        partes.append(f"mediana: {GRUPOS_MEDIANA.get(c.get('grupo_mediana'), GRUPOS_MEDIANA['regiao'])}")
+        partes.append(f"mediana da indústria de cada empresa: {GRUPOS_MEDIANA.get(c.get('grupo_mediana'), GRUPOS_MEDIANA['regiao'])}")
+    if c["top"]:
+        partes.append(f"as {c['top']} melhores")
     return "; ".join(partes)
+
+
+def industrias_por_setor() -> dict[str, list[str]]:
+    """{setor do Yahoo: [indústrias do screener]} (as mesmas da página)."""
+    try:
+        from yfinance.const import EQUITY_SCREENER_EQ_MAP
+        return {s: sorted(v) for s, v in EQUITY_SCREENER_EQ_MAP.get("industry", {}).items()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def consultas_universo(setores: list[str], industrias: list[str], mapa: dict | None = None) -> list[tuple[list, list | None]]:
+    """[(setores, indústrias)] para o screener. Um setor sem nenhuma indústria escolhida entra inteiro; nos setores com
+    indústrias escolhidas, só essas. Nada escolhido = todos os setores."""
+    if not setores and not industrias:
+        return [([], None)]
+    mapa = industrias_por_setor() if mapa is None else mapa
+    setor_de = {i: s for s, lista in mapa.items() for i in lista}
+    com_escolha = {setor_de.get(i) for i in industrias}
+    inteiros = [s for s in setores if s not in com_escolha]
+    out = [(inteiros, None)] if inteiros else []
+    if industrias:
+        out.append(([], list(industrias)))
+    return out
+
+
+def grupo_da_empresa(linha, resultado: dict) -> tuple[str | None, dict | None]:
+    """(nome, grupo) com que uma empresa se compara numa procura: a sua indústria, se tiver medianas próprias (empresas
+    suficientes); senão, o seu setor."""
+    grupos = (resultado or {}).get("grupos") or {}
+    for nome in (linha.get("Indústria"), linha.get("Setor")):
+        if nome is not None and str(nome) in grupos:
+            return str(nome), grupos[str(nome)]
+    return None, None
 
 
 def mesma_industria(a, b) -> bool:
@@ -453,14 +530,15 @@ def _valores(linha) -> dict:
 
 def executar_v2(crit: dict, progresso=None) -> dict:
     """
-    1. Universo: as empresas da área (EUA e Canadá, ou Europa), do setor e da indústria escolhidos, com a capitalização
-       mínima; analisadas pelo motor pela ordem escolhida (as maiores primeiro, por omissão), até ao limite.
-    2. Medianas (só se algum critério for «melhor que a mediana»): cada empresa compara-se com o seu grupo — a indústria
-       escolhida; com a indústria em «todas», o setor de cada empresa. Com o grupo «EUA, Canadá e Europa juntos», as
-       empresas da outra área entram também no cálculo (não nos resultados). Com menos de min_empresas analisadas na
-       indústria, recua-se para o setor, na mesma área, e diz-se porquê.
+    1. Universo: as empresas da área (EUA e Canadá, ou Europa), dos setores e indústrias escolhidos (vários; um setor sem
+       indústria escolhida entra inteiro), com a capitalização mínima; analisadas pelo motor pela ordem escolhida (as
+       maiores primeiro, por omissão), até ao limite.
+    2. Medianas: cada empresa compara-se com a mediana da SUA indústria, se essa indústria tiver pelo menos min_empresas
+       analisadas; senão, com a do seu setor (a nota diz quais recuaram). Se foram escolhidas indústrias pequenas, o setor
+       delas analisa-se também, só para a mediana. Com «EUA, Canadá e Europa juntos», as empresas da outra área entram no
+       cálculo (não nos resultados).
     3. Cada critério cumpre ou falha; os critérios pela mediana num grupo sem mediana não contam. Passa quem cumpre a
-       percentagem escolhida.
+       percentagem escolhida; ficam as «top» melhores (chave_ordem).
     Devolve o mesmo que executar (df das que passam, contagens) e «resultado»: os valores de todas as analisadas e as
     medianas de todos os grupos, para a página recalcular na hora quando se mudam os critérios.
     """
@@ -469,73 +547,82 @@ def executar_v2(crit: dict, progresso=None) -> dict:
     c = normalizar(crit)
     area = c.get("area") if c.get("area") in AREAS else "eua_canada"
     regs = AREAS[area][1]
-    setor, industria = c.get("setor") or "", c.get("industria") or ""
+    outra_area = AREAS["europa" if area == "eua_canada" else "eua_canada"][1]
+    setores, industrias = c["setores"], c["industrias"]
     mcap, limite = float(c.get("mcap") or 5000) * 1e6, int(c.get("limite") or 200)
     p = parametros(c)
     ativos = criterios_ativos(c)
     usa_mediana = any(m == "mediana" for _k, m, _l in ativos)
     grupo_med = c.get("grupo_mediana") if c.get("grupo_mediana") in GRUPOS_MEDIANA else "regiao"
     min_emp = int(c.get("min_empresas") or MIN_EMPRESAS_OMISSAO)
+    top = int(c.get("top") or 0)
 
-    def analisar(regioes, setores_, industrias_):
-        uni = listar_universo(regioes, mcap, [], setores_, progresso=progresso, industrias=industrias_)
+    def analisar(regioes, consultas):
+        partes = [listar_universo(regioes, mcap, [], s, progresso=progresso, industrias=i) for s, i in consultas]
+        partes = [x for x in partes if not x.empty]
+        uni = pd.concat(partes, ignore_index=True).drop_duplicates("Ticker") if partes else pd.DataFrame()
         uni = ordenar(uni, c.get("ordem") or ORDENS[0])
         tickers = uni["Ticker"].tolist()[:limite] if not uni.empty else []
         df_, falhas_ = (analisar_lote(tickers, p, progresso=progresso, paises=paises_das_regioes(regioes))
                         if tickers else (pd.DataFrame(), []))
         return df_, falhas_, len(uni)
 
-    filtro = ([setor] if setor else [], [industria] if industria else None)
-    df, falhas, n_universo = analisar(regs, *filtro)
+    def juntar(*dfs):
+        dfs = [x for x in dfs if x is not None and not x.empty]
+        return pd.concat(dfs, ignore_index=True).drop_duplicates("Ticker") if dfs else pd.DataFrame()
+
+    consultas = consultas_universo(setores, industrias)
+    df, falhas, n_universo = analisar(regs, consultas)
     pares, nota = df, None
-    coluna_grupo = "Indústria" if industria else "Setor"
-    nivel = "industria" if industria else ("setor" if setor else "setor de cada empresa")
-    if usa_mediana:
-        if grupo_med == "eua_europa":
-            outra = AREAS["europa" if area == "eua_canada" else "eua_canada"][1]
-            df_o, _f, _n = analisar(outra, *filtro)
-            pares = pd.concat([df, df_o], ignore_index=True) if not df_o.empty else df
-        if industria and len(pares) < min_emp:
-            setor_ind = setor or (str(df["Setor"].iloc[0]) if not df.empty else "")
-            setor_yahoo = setor or next((k for k, v in SETORES.items() if v == setor_ind), setor_ind)
-            if setor_yahoo:
-                regs_pares = regs if grupo_med == "regiao" else regs + AREAS["europa" if area == "eua_canada" else "eua_canada"][1]
-                p_setor, _f, _n = analisar(regs_pares, [setor_yahoo], None)
-                if len(p_setor) > len(pares):
-                    nota = (f"só {len(pares)} empresas analisadas na indústria ({industria.replace('—', ' - ')}), abaixo do mínimo de "
-                            f"{min_emp}: as medianas são as do setor {SETORES.get(setor_yahoo, setor_yahoo)}")
-                    pares, coluna_grupo, nivel = p_setor, "Setor", "setor (recuo: poucas empresas na indústria)"
-    # as medianas calculam-se sempre (a página deixa mudar um critério para «mediana» sem nova procura)
-    grupos = calcular_grupos(pares, coluna_grupo)
-    if usa_mediana:
-        pequenos = [g for g, x in grupos.items() if x["n"] < min_emp]
-        if pequenos and not nota:
-            nota = f"grupos com menos de {min_emp} empresas (medianas pouco fiáveis): {', '.join(pequenos[:6])}"
+    if usa_mediana and grupo_med == "eua_europa":
+        pares = juntar(df, analisar(outra_area, consultas)[0])
+    # indústrias com empresas suficientes têm mediana própria; as outras recuam para o setor
+    g_ind = calcular_grupos(pares, "Indústria")
+    grandes = {g for g, x in g_ind.items() if x["n"] >= min_emp}
+    pequenas = sorted({str(x) for x in (df["Indústria"] if "Indústria" in df else []) if x is not None and str(x) not in grandes})
+    pares_setor = pares
+    if usa_mediana and industrias and pequenas:
+        # escolheram-se indústrias: o resto do setor não foi analisado; analisa-se agora, só para a mediana do setor
+        pt_yahoo, inteiros = {v: k for k, v in SETORES.items()}, {s for ss, i in consultas if i is None for s in ss}
+        setores_falta = sorted({pt_yahoo.get(str(s), str(s)) for s, i in zip(df["Setor"], df["Indústria"]) if str(i) in pequenas and s}
+                               - inteiros)  # um setor escolhido inteiro já está todo analisado
+        if setores_falta:
+            regs_pares = regs if grupo_med == "regiao" else regs + outra_area
+            pares_setor = juntar(pares, analisar(regs_pares, [(setores_falta, None)])[0])
+    grupos = {g: {**g_ind[g], "nivel": "indústria"} for g in grandes}
+    for g, x in calcular_grupos(pares_setor, "Setor").items():
+        grupos.setdefault(g, {**x, "nivel": "setor"})
+    if usa_mediana and pequenas:
+        nota = (f"indústrias com menos de {min_emp} empresas analisadas, comparadas com a mediana do setor: "
+                + ", ".join(pequenas[:8]) + (f" e mais {len(pequenas) - 8}" if len(pequenas) > 8 else ""))
 
     limiar = float(c.get("limiar", LIMIAR_POR_OMISSAO))
-    empresas, passa, cumpridos, textos, nao = [], [], [], [], []
+    empresas, avals = [], []
     for _, linha in df.iterrows():
-        g = str(linha.get(coluna_grupo)) if coluna_grupo in linha else None
+        g, grupo = grupo_da_empresa(linha, {"grupos": grupos})
         vals = _valores(linha)
-        a = avaliar(vals, grupos.get(g), ativos, limiar)
-        passa.append(a["passa"])
-        cumpridos.append(a["cumpre"] / a["total"] if a["total"] else None)
-        textos.append(f"{a['cumpre']} de {a['total']}")
-        nao.append("; ".join(x["texto"] for x in a["criterios"] if x["cumpre"] is False))
+        a = avaliar(vals, grupo, ativos, limiar)
+        avals.append(a)
         empresas.append({"Ticker": linha["Ticker"], "Empresa": linha.get("Empresa"), "País": linha.get("País"), "Setor": linha.get("Setor"),
                          "Indústria": linha.get("Indústria"), "grupo": g, "Classificação": linha.get("Classificação"),
                          "Moeda": linha.get("Moeda"), "Preço atual": linha.get("Preço atual"), "valores": vals})
     out = df.copy()
     if not out.empty:
-        out = out.assign(**{"Critérios cumpridos": cumpridos, "Critérios": textos, "Não cumpriu": nao})
-        out = out[pd.Series(passa, index=out.index)] if ativos else out
-        out = out.sort_values(["ordem", "Critérios cumpridos", "Preço (nota)"], ascending=[True, False, False]).reset_index(drop=True)
+        out = out.assign(**{"Critérios cumpridos": [a["cumpre"] / a["total"] if a["total"] else None for a in avals],
+                            "Critérios": [f"{a['cumpre']} de {a['total']}" for a in avals],
+                            "Não cumpriu": ["; ".join(x["texto"] for x in a["criterios"] if x["cumpre"] is False) for a in avals],
+                            "_ordem": [chave_ordem(a, str(t)) for a, t in zip(avals, df["Ticker"])]})
+        if ativos:
+            out = out[pd.Series([a["passa"] for a in avals], index=out.index)]
+        out = out.sort_values("_ordem").drop(columns="_ordem").reset_index(drop=True)
+        if top:
+            out = out.head(top)
         if not out.empty:
             out.attrs["descricao"] = descricao_v2(c)
     total, minimo = contagem_v2(c)
-    resultado = {"quando": datetime.now().isoformat(timespec="minutes"), "area": area, "area_nome": AREAS[area][0], "setor": setor,
-                 "industria": industria, "mcap": c.get("mcap"), "limite": limite, "nivel": nivel, "coluna_grupo": coluna_grupo,
+    resultado = {"quando": datetime.now().isoformat(timespec="minutes"), "area": area, "area_nome": AREAS[area][0], "setores": setores,
+                 "industrias": industrias, "mcap": c.get("mcap"), "limite": limite, "metodo": c["metodo"], "top": top,
                  "grupo_mediana": grupo_med, "min_empresas": min_emp, "nota": nota, "n_universo": n_universo, "n_analisadas": len(df),
-                 "n_pares": len(pares) if usa_mediana else None, "grupos": grupos, "empresas": empresas, "falhas": len(falhas)}
+                 "n_pares": len(pares_setor) if usa_mediana else None, "grupos": grupos, "empresas": empresas, "falhas": len(falhas)}
     return {"df": out, "falhas": falhas, "universo": n_universo, "a_analisar": min(limite, n_universo), "analisadas": len(df),
             "filtros_depois": False, "criterios": total, "minimo": minimo, "descricao": descricao_v2(c), "resultado": resultado}

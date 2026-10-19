@@ -1122,17 +1122,20 @@ def pesquisa_criterios(ticker: str):
         except Exception:  # noqa: BLE001
             universo.append({"texto": "Capitalização mínima", "cumpre": None, "detalhe": "sem câmbio"})
         filtros_mod = _desc_mod("filtros")
-        if crit.get("setor"):
-            setor_pt = filtros_mod.SETORES.get(crit["setor"], crit["setor"])
-            universo.append({"texto": f"Setor: {setor_pt}", "cumpre": linha.get("Setor") == setor_pt if linha.get("Setor") else None,
-                             "detalhe": linha.get("Setor") or "lacuna"})
-        if crit.get("industria"):
-            universo.append({"texto": f"Indústria: {crit['industria'].replace('—', ' - ')}",
-                             "cumpre": pesq.mesma_industria(crit["industria"], linha.get("Indústria")) if linha.get("Indústria") else None,
-                             "detalhe": linha.get("Indústria") or "lacuna"})
+        if crit["setores"] or crit["industrias"]:
+            # setores inteiros ou só as indústrias escolhidas (pesq.consultas_universo, como o screener)
+            pt = lambda s: filtros_mod.SETORES.get(s, s)  # noqa: E731
+            dentro = None
+            if linha.get("Setor") or linha.get("Indústria"):
+                dentro = any((not s or linha.get("Setor") in [pt(x) for x in s])
+                             and (not i or any(pesq.mesma_industria(x, linha.get("Indústria")) for x in i))
+                             for s, i in pesq.consultas_universo(crit["setores"], crit["industrias"]))
+            universo.append({"texto": "Setor / indústria: " + "; ".join(
+                                [", ".join(pt(s) for s in crit["setores"])] + [", ".join(i.replace("—", " - ") for i in crit["industrias"])]).strip("; "),
+                             "cumpre": dentro, "detalhe": f"{linha.get('Setor') or 'lacuna'} · {linha.get('Indústria') or 'lacuna'}"})
         # Critérios com os valores do motor; os pela mediana usam as medianas do grupo da empresa na última procura
         res = resultados.get(p["id"]) or {}
-        grupo = (res.get("grupos") or {}).get(str(linha.get(res.get("coluna_grupo") or "Setor")))
+        _g, grupo = pesq.grupo_da_empresa(linha, res)
         aval = pesq.avaliar(pesq._valores(linha), grupo, pesq.criterios_ativos(crit), float(crit.get("limiar", 0.8)))
         criterios = [{"texto": x["texto"] if x["cumpre"] is not None else x["texto"] + " (sem mediana do grupo na última procura)",
                       "cumpre": x["cumpre"], "origem": "motor da Descoberta" + (" · mediana da última procura" if x["modo"] == "mediana" else "")}
@@ -1192,6 +1195,7 @@ def _opcoes_mediana(filtros) -> dict:
         industrias = {}
     return {"areas": {k: v[0] for k, v in pesq.AREAS.items()}, "industrias": industrias, "grupos_mediana": pesq.GRUPOS_MEDIANA,
             "min_empresas_omissao": pesq.MIN_EMPRESAS_OMISSAO, "grupos_criterios": pesq.GRUPOS_CRITERIOS,
+            "metodos": pesq.METODOS, "top_omissao": pesq.TOP_OMISSAO,
             "catalogo": [{"chave": k, "rotulo": r, "grupo": g, "coluna": col, "sentido": s, "fmt": f, "padrao": pad, "passo": passo,
                           "ajuda": aj, "so_limite": k in pesq.SO_LIMITE, "so_positivo": k in pesq.SO_POSITIVOS}
                          for k, r, g, col, s, f, pad, passo, aj in pesq.CATALOGO]}
