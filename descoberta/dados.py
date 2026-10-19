@@ -34,13 +34,17 @@ def _gravar_cache(chave: str, valor) -> None:
         pickle.dump(valor, fh)
 
 
-def com_repeticao(funcao, tentativas: int = 3, espera: float = 5.0):
-    """O Yahoo devolve 'Too Many Requests' quando se pede demasiado depressa: espera e tenta outra vez."""
+def com_repeticao(funcao, tentativas: int = 4, espera: float = 5.0):
+    """O Yahoo devolve 'Too Many Requests' quando se pede demasiado depressa: espera e tenta outra vez.
+    Também o HTTP 401: com a chave de sessão («crumb») recusada por excesso de pedidos (429), o screener responde 401
+    (pesquisas INDUSTRIA EUROPA e SAUDE EUROPA, 19/10/2026, corridas logo a seguir a outras)."""
     for i in range(tentativas):
         try:
             return funcao()
         except Exception as e:  # noqa: BLE001
-            limite = "Too Many Requests" in str(e) or "Rate" in type(e).__name__
+            texto = str(e)
+            limite = ("Too Many Requests" in texto or "Rate" in type(e).__name__
+                      or "HTTP Error 401" in texto or "HTTP Error 429" in texto or "Invalid Crumb" in texto)
             if not limite or i == tentativas - 1:
                 raise
             time.sleep(espera * (i + 1) ** 2)
