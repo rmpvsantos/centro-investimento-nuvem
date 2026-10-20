@@ -271,14 +271,22 @@ def descarregar_relatorios() -> int:
     for nome in ("CARTEIRA INVESTIMENTOS", "EM OBSERVAÇÃO", "ANALISES ANTIGAS"):
         (PASTAS["relatorios"] / nome).mkdir(parents=True, exist_ok=True)
     registar(f"Relatórios: {len(lista)} ({len(falta)} descarregados agora).")
-    global SINCRONIA
-    t1 = time.time()
-    SINCRONIA = sincronia_relatorios(lista)
-    registar(f"  comparação com a lista do PC: {time.time() - t1:.0f} s")
+
+    # a comparação com a lista do PC (2 a 18 s) é só para o painel: corre ao lado, sem atrasar o arranque (20/10/2026)
+    def comparar():
+        t1 = time.time()
+        try:
+            SINCRONIA.update(sincronia_relatorios(lista))
+        except Exception as e:  # noqa: BLE001
+            SINCRONIA.update({"estado": "erro", "erro": str(e)[:200]})
+        registar(f"  comparação com a lista do PC: {time.time() - t1:.0f} s (em paralelo)")
+    FIOS.append(threading.Thread(target=comparar, daemon=True))
+    FIOS[-1].start()
     return len(lista)
 
 
 SINCRONIA: dict = {}
+FIOS: list[threading.Thread] = []  # trabalhos ao lado que têm de acabar antes de gravar o estado da volta
 
 
 def aplicar_mudancas_pastas() -> None:
@@ -504,8 +512,10 @@ def marcar_visto(t: str) -> None:
 def correr_pesquisas(ident: str | None = None) -> tuple[int, list[str]]:
     args = [sys.executable, "-u", "automatico.py"] + (["--pesquisa", ident] if ident else ["--todas"]) + ["--sem-notificacao"]
     registar("Pesquisa automática: " + (ident or "todas") + "…")
-    r = subprocess.run(args, cwd=DESCOBERTA, env=ambiente(), capture_output=True, text=True, encoding="utf-8", errors="replace")
-    linhas = (r.stdout + r.stderr).strip().splitlines()[-12:]
+    # sem os avisos de contas com valores em falta: enchiam o registo e escondiam o erro verdadeiro (20/10/2026)
+    r = subprocess.run(args, cwd=DESCOBERTA, env={**ambiente(), "PYTHONWARNINGS": "ignore::RuntimeWarning"},
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    linhas = [l for l in (r.stdout + r.stderr).strip().splitlines() if "Warning" not in l][-12:]
     for l in linhas[-4:]:
         registar("  " + l)
     return r.returncode, linhas
@@ -780,6 +790,17 @@ def main() -> int:
     # raiz; nos pedidos da app usa-se a cópia guardada dos ficheiros iguais aos do Drive
     TRANSFERENCIA["memoria"] = not (args.tudo or args.pesquisa)
     t0 = time.time()
+    # a lista dos relatórios (ligação + cópia local) vai em paralelo com os dados: são idas independentes à ligação
+    erro_rel: list[BaseException] = []
+
+    def relatorios():
+        try:
+            descarregar_relatorios()
+            registar(f"Lista dos relatórios em {time.time() - t0:.0f} s (em paralelo com os dados).")
+        except BaseException as e:  # noqa: BLE001
+            erro_rel.append(e)
+    fio_rel = threading.Thread(target=relatorios, daemon=True)
+    fio_rel.start()
     pacotes = ler_drive("nuvem", list(PACOTES) + ["cowork_estado.json"])
     for nome in PACOTES:
         desempacotar(nome, pacotes.get(nome))
@@ -798,8 +819,10 @@ def main() -> int:
     t1 = time.time()
     registar(f"Dados do Drive em {t1 - t0:.0f} s: {TRANSFERENCIA['iguais']} da cópia guardada (iguais ao Drive), "
              f"{TRANSFERENCIA['descarregados']} descarregados.")
-    descarregar_relatorios()
-    registar(f"Lista dos relatórios em {time.time() - t1:.0f} s.")
+    fio_rel.join()
+    if erro_rel:
+        raise erro_rel[0]
+    registar(f"Dados e relatórios prontos em {time.time() - t0:.0f} s.")
     aplicar_mudancas_pastas()
 
     procs = arrancar()
@@ -851,6 +874,8 @@ def main() -> int:
         guardar_dados(originais)
         if feitos:
             ligacao("trab_concluirPedidos", feitos)
+        for f in FIOS:  # a comparação dos relatórios (em paralelo) entra no estado da volta
+            f.join(timeout=60)
         ligacao("trab_gravarFicheiros", {"pasta": "nuvem", "ficheiros": {"estado.json": json.dumps({
             "inicio": inicio.isoformat(timespec="seconds"), "fim": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "motivo": os.environ.get("MOTIVO") or ("pesquisa" if args.pesquisa else "agendada" if args.tudo else "pedido"),

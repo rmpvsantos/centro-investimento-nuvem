@@ -504,6 +504,16 @@ def consultas_universo(setores: list[str], industrias: list[str], mapa: dict | N
     return out
 
 
+def setores_para_mediana(df: pd.DataFrame, pequenas: list[str], consultas: list[tuple]) -> list[str]:
+    """Setores (nomes do Yahoo) a analisar só para a mediana: os das empresas de indústrias pequenas, exceto os setores
+    escolhidos inteiros (já analisados). Só setores conhecidos: o Yahoo às vezes não dá o setor de uma empresa (NaN, que
+    como texto era «nan» e rebentava a procura com «Invalid EQ value "nan"», SOFTWARE EUA, 20/10/2026)."""
+    pt_yahoo = {v: k for k, v in SETORES.items()}
+    inteiros = {s for ss, i in consultas if i is None for s in ss}
+    return sorted({pt_yahoo[str(s)] for s, i in zip(df["Setor"], df["Indústria"])
+                   if pd.notna(s) and pd.notna(i) and str(i) in pequenas and str(s) in pt_yahoo} - inteiros)
+
+
 def grupo_da_empresa(linha, resultado: dict) -> tuple[str | None, dict | None]:
     """(nome, grupo) com que uma empresa se compara numa procura: a sua indústria, se tiver medianas próprias (empresas
     suficientes); senão, o seu setor."""
@@ -579,13 +589,11 @@ def executar_v2(crit: dict, progresso=None) -> dict:
     # indústrias com empresas suficientes têm mediana própria; as outras recuam para o setor
     g_ind = calcular_grupos(pares, "Indústria")
     grandes = {g for g, x in g_ind.items() if x["n"] >= min_emp}
-    pequenas = sorted({str(x) for x in (df["Indústria"] if "Indústria" in df else []) if x is not None and str(x) not in grandes})
+    pequenas = sorted({str(x) for x in (df["Indústria"] if "Indústria" in df else []) if pd.notna(x) and str(x) not in grandes})
     pares_setor = pares
     if usa_mediana and industrias and pequenas:
         # escolheram-se indústrias: o resto do setor não foi analisado; analisa-se agora, só para a mediana do setor
-        pt_yahoo, inteiros = {v: k for k, v in SETORES.items()}, {s for ss, i in consultas if i is None for s in ss}
-        setores_falta = sorted({pt_yahoo.get(str(s), str(s)) for s, i in zip(df["Setor"], df["Indústria"]) if str(i) in pequenas and s}
-                               - inteiros)  # um setor escolhido inteiro já está todo analisado
+        setores_falta = setores_para_mediana(df, pequenas, consultas)
         if setores_falta:
             regs_pares = regs if grupo_med == "regiao" else regs + outra_area
             pares_setor = juntar(pares, analisar(regs_pares, [(setores_falta, None)])[0])
