@@ -504,9 +504,10 @@ def listas_mudaram(estado: dict) -> bool:
 # botão «Mover para…» da Decisão faz no PC).
 # ---------------------------------------------------------------------------------------------------------------------
 ESTUDOS = Path.home() / "OneDrive" / "Ambiente de Trabalho" / "Estudos Empresas-Relatorios"
-# Desde 17/10/2026 a Carteira, a técnica rápida e as triagens calculam-se só na nuvem (as apps do PC foram retiradas):
-# no PC o vigilante é só a ponte com o Cowork (pedidos de relatório e mudanças de pasta). False volta ao modo antigo.
-SO_PONTE_COWORK = True
+# De 17 a 20/10/2026 a Carteira, a técnica rápida e as triagens calcularam-se só na nuvem (SO_PONTE_COWORK = True).
+# A 20/10/2026 o Rui decidiu voltar ao PC (a nuvem era lenta e falhava): o vigilante volta a fazer tudo no PC e a nuvem
+# fica só para ver no telemóvel (recebe os dados do PC em para_nuvem).
+SO_PONTE_COWORK = False
 
 
 def da_nuvem(pasta: Path | None, estado: dict) -> None:
@@ -521,7 +522,8 @@ def da_nuvem(pasta: Path | None, estado: dict) -> None:
         return
     pedidos = ESTUDOS / "_PEDIDOS"
     mtime = pacote.stat().st_mtime
-    if estado.get("nuvem_mtime") != mtime:
+    # com a nuvem só para ver (desde 20/10/2026), de lá não vêm pedidos nem mudanças de pasta: o pacote é escrito pelo PC
+    if SO_PONTE_COWORK and estado.get("nuvem_mtime") != mtime:
         ficheiros = json.loads(pacote.read_text(encoding="utf-8")).get("ficheiros", {})
         ler = lambda k: gzip.decompress(base64.b64decode(ficheiros[k]))  # noqa: E731
         for rel in ficheiros:
@@ -572,10 +574,59 @@ def da_nuvem(pasta: Path | None, estado: dict) -> None:
         estado["pc_visto"] = time.time()
 
 
+# Do PC para a nuvem (desde 20/10/2026): os dados de trabalho das apps do PC vão para a pasta «Centro - nuvem» do Google
+# Drive, no mesmo formato que o trabalhador da nuvem lê (pacotes de trabalho.py). A app na internet é só para ver.
+_CASA = Path.home()
+PACOTES_PC = {
+    "dados_decisao.json": [(_CASA / "OneDrive" / "Documentos" / "Decisão de Investimento" / "Dados da app", "", "*")],
+    "dados_centro.json": [(_CASA / "Documents" / "centro_investimento" / "dados", "", "*"), (ESTUDOS / "_PEDIDOS", "pedidos_cowork/", "*.json")],
+    "dados_descoberta.json": [(ESTUDOS / "APP" / "triagem_acoes" / "pesquisas", "pesquisas/", "*"),
+                              (ESTUDOS / "APP" / "triagem_acoes" / "resultados", "resultados/", "*")],
+}
+MIN_ENTRE_ENVIOS = 60  # segundos: várias gravações seguidas (ex.: uma análise) vão num só envio
+
+
+def _ficheiros_pc(nome: str) -> list[tuple[str, Path]]:
+    out = []
+    for pasta, prefixo, padrao in PACOTES_PC[nome]:
+        if pasta.exists():
+            for f in sorted(pasta.rglob(padrao)):
+                if f.is_file() and "__pycache__" not in f.parts and not f.name.endswith((".tmp", ".lock")):
+                    out.append((prefixo + f.relative_to(pasta).as_posix(), f))
+    return out
+
+
+def para_nuvem(pasta: Path | None, estado: dict) -> None:
+    import base64
+    import gzip
+    import hashlib
+
+    nuvem = pasta.parent / "Centro - nuvem" if pasta else None
+    if not nuvem or not nuvem.is_dir() or time.time() - estado.get("pacotes_envio", 0) < MIN_ENTRE_ENVIOS:
+        return
+    assinaturas = estado.setdefault("pacotes_assinatura", {})
+    for nome in PACOTES_PC:
+        fic = _ficheiros_pc(nome)
+        # assinatura barata (nomes, tamanhos e datas): só se empacota quando algo mudou
+        assin = hashlib.sha1(json.dumps([(r, f.stat().st_size, int(f.stat().st_mtime)) for r, f in fic]).encode("utf-8")).hexdigest()
+        if assinaturas.get(nome) == assin:
+            continue
+        pacote = {"versao": 1, "ficheiros": {r: base64.b64encode(gzip.compress(f.read_bytes(), 6, mtime=0)).decode("ascii") for r, f in fic},
+                  "datas": {r: int(f.stat().st_mtime) for r, f in fic}}
+        tmp = nuvem / f"~{nome}"
+        tmp.write_text(json.dumps(pacote, sort_keys=True), encoding="utf-8")
+        tmp.replace(nuvem / nome)
+        assinaturas[nome] = assin
+        estado["pacotes_envio"] = time.time()
+        registar(f"Para a nuvem (só para ver): {nome} ({len(fic)} ficheiros).")
+
+
 def uma_volta(pasta: Path | None, forcar: bool = False) -> None:
     estado = ler_estado()
     if not NA_NUVEM:
         try:
+            if not SO_PONTE_COWORK:
+                para_nuvem(pasta, estado)
             da_nuvem(pasta, estado)
         except Exception as e:  # noqa: BLE001  (a nuvem é um extra: não pode parar a sincronização)
             registar(f"Da nuvem: {type(e).__name__}: {e}")

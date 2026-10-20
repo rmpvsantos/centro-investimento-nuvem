@@ -591,6 +591,8 @@ def carteira_pediu() -> bool:
 
 def guardar_dados(originais: dict) -> None:
     """Os pacotes de dados que mudaram voltam ao Drive (e passam a ser a referência para a próxima comparação)."""
+    if SO_LEITURA:
+        return  # os dados são do PC: a nuvem nunca os grava por cima
     novos = {}
     for nome in PACOTES:
         texto = empacotar(nome)
@@ -642,6 +644,10 @@ def fazer_carteira(resp: Respostas, tudo: bool, sincronizar: bool, escreveu: boo
 # lança outra volta (Nuvem.js: trab_vivo, trab_sair, VIVO_MS).
 # ---------------------------------------------------------------------------------------------------------------------
 SERVICO = {"ativo": False}
+# Desde 20/10/2026 (o Rui voltou ao PC): a nuvem é só para ver. Os dados vêm do PC (o vigilante de sincronizar.py grava
+# os pacotes no Drive) e esta volta só calcula as páginas: não trata pedidos, não fica de serviço, não grava os pacotes
+# por cima dos do PC, não mexe em pastas nem na Carteira (o PC faz isso). False volta ao modo de 17 a 20/10.
+SO_LEITURA = True
 SERVICO_MIN = float(os.environ.get("TRAB_SERVICO_MIN") or 8)  # (o ensaio local encurta-o)
 ESPERA_FILA = 3
 
@@ -778,6 +784,8 @@ def main() -> int:
         print("Faltam LIGACAO_URL, GITHUB_TOKEN ou GITHUB_RUN_ID.")
         return 2
     inicio = datetime.now(timezone.utc)
+    if SO_LEITURA:  # qualquer volta é uma atualização completa das páginas (as pesquisas correm no PC)
+        args.tudo, args.pesquisa = True, False
     TRAB.mkdir(parents=True, exist_ok=True)
     for p in PASTAS.values():
         p.mkdir(parents=True, exist_ok=True)
@@ -823,7 +831,14 @@ def main() -> int:
     if erro_rel:
         raise erro_rel[0]
     registar(f"Dados e relatórios prontos em {time.time() - t0:.0f} s.")
-    aplicar_mudancas_pastas()
+    if SO_LEITURA:
+        # os sinais (para o aviso «sinal mudou» no Telegram) guardam-se à parte: o PC não os escreve, e sem isto a mesma
+        # mudança era avisada em todas as voltas
+        s = ler_drive("nuvem", ["sinais_nuvem.json"]).get("sinais_nuvem.json")
+        if s:
+            (PASTAS["decisao_dados"] / "sinais.json").write_text(s, encoding="utf-8")
+    else:
+        aplicar_mudancas_pastas()
 
     procs = arrancar()
     resp = Respostas()
@@ -834,7 +849,7 @@ def main() -> int:
         if args.pesquisa:
             correr_pesquisas()
         # 2. Pedidos da app, com as respostas gerais e as das empresas tocadas; a app recebe-os logo
-        n_pedidos, escreveu, tocadas = tratar_lote(resp, originais)
+        n_pedidos, escreveu, tocadas = tratar_lote(resp, originais, [] if SO_LEITURA else None)
         if vida:
             vida.__exit__()
             vida = None
@@ -853,6 +868,9 @@ def main() -> int:
                 if len(resp.alterados) >= 12:
                     resp.enviar()  # vai enviando: a app vê as primeiras empresas sem esperar pelas últimas
         registar_sinais(resp)
+        if SO_LEITURA and (PASTAS["decisao_dados"] / "sinais.json").exists():
+            ligacao("trab_gravarFicheiros", {"pasta": "nuvem", "ficheiros": {
+                "sinais_nuvem.json": (PASTAS["decisao_dados"] / "sinais.json").read_text(encoding="utf-8")}})
         # Candidatas (sem rede: lê o resumo de cada decisão) sempre que se calculou alguma empresa; o Diário (vai ao Yahoo
         # buscar os preços de todas) nas voltas completas e quando entrou um sinal novo
         if SINAIS_AGORA:
@@ -864,7 +882,8 @@ def main() -> int:
         # 4. A Carteira no Google (painel da Decisão, técnica rápida, triagens e listas pedidas lá): nas voltas agendadas,
         # quando a app gravou alguma coisa (mudar de lista, notas, regras) ou quando a Carteira deixou pedidos por tratar.
         # Num clique só de leitura não corre (era 1,5 minutos que atrasavam o pedido seguinte).
-        fazer_carteira(resp, args.tudo, bool(args.tudo or args.pesquisa or escreveu or carteira_pediu()), escreveu)
+        if not SO_LEITURA:  # com a nuvem só para ver, a Carteira é sincronizada pelo vigilante do PC
+            fazer_carteira(resp, args.tudo, bool(args.tudo or args.pesquisa or escreveu or carteira_pediu()), escreveu)
     except Exception as e:  # noqa: BLE001
         erro = f"{type(e).__name__}: {e}"
         registar("ERRO: " + erro)

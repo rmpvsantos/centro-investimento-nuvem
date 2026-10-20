@@ -589,7 +589,7 @@ def executar_v2(crit: dict, progresso=None) -> dict:
     # indústrias com empresas suficientes têm mediana própria; as outras recuam para o setor
     g_ind = calcular_grupos(pares, "Indústria")
     grandes = {g for g, x in g_ind.items() if x["n"] >= min_emp}
-    pequenas = sorted({str(x) for x in (df["Indústria"] if "Indústria" in df else []) if pd.notna(x) and str(x) not in grandes})
+    pequenas = sorted({str(x) for x in (df["Indústria"] if "Indústria" in df else []) if pd.notna(x) and str(x).strip() and str(x) not in grandes})
     pares_setor = pares
     if usa_mediana and industrias and pequenas:
         # escolheram-se indústrias: o resto do setor não foi analisado; analisa-se agora, só para a mediana do setor
