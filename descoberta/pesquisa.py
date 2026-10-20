@@ -594,9 +594,9 @@ def executar_v2(crit: dict, progresso=None) -> dict:
     grandes = {g for g, x in g_ind.items() if x["n"] >= min_emp}
     pequenas = sorted({str(x) for x in (df["Indústria"] if "Indústria" in df else []) if pd.notna(x) and str(x).strip() and str(x) not in grandes})
     pares_setor = pares
-    if industrias:
-        # escolheram-se indústrias: o resto do setor não foi analisado; analisa-se agora, só para a mediana do setor (com
-        # que as empresas se comparam na tabela; desde 20/10/2026 a mediana não elimina ninguém)
+    if usa_mediana and industrias:
+        # (só nas pesquisas pela mediana, que já não se usam: desde 20/10/2026 a comparação é com a mediana das 15 melhores,
+        # calculada na página, e não é preciso analisar o resto do setor)
         todas = sorted({str(x) for x in (df["Indústria"] if "Indústria" in df else []) if pd.notna(x) and str(x).strip()})
         setores_falta = setores_para_mediana(df, todas, consultas)
         if setores_falta:
@@ -608,9 +608,6 @@ def executar_v2(crit: dict, progresso=None) -> dict:
     if usa_mediana and pequenas:
         nota = (f"indústrias com menos de {min_emp} empresas analisadas, comparadas com a mediana do setor: "
                 + ", ".join(pequenas[:8]) + (f" e mais {len(pequenas) - 8}" if len(pequenas) > 8 else ""))
-    pequenos_setores = [g for g, x in grupos.items() if x.get("nivel") == "setor" and x["n"] < min_emp]
-    if not usa_mediana and pequenos_setores:
-        nota = f"mediana do setor com menos de {min_emp} empresas (pouco fiável): {', '.join(pequenos_setores)}"
 
     limiar = float(c.get("limiar", LIMIAR_POR_OMISSAO))
     empresas, avals = [], []
