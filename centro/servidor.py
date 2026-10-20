@@ -1201,6 +1201,28 @@ def _opcoes_mediana(filtros) -> dict:
                          for k, r, g, col, s, f, pad, passo, aj in pesq.CATALOGO]}
 
 
+_contagens: dict = {}
+
+
+@app.get("/api/pesquisa/contar")
+def pesquisa_contar(area: str, setores: str = "", industrias: str = "", mcap: float = 5000):
+    """Quantas empresas há na área, setores e indústrias escolhidos (screener do Yahoo, sem as analisar), para o Rui ver o
+    universo logo ao escolher (pedido de 20/10/2026). Setores e indústrias separados por «|». Guardado 6 horas."""
+    pesq, uni = _desc_mod("pesquisa"), _desc_mod("universo")
+    if area not in pesq.AREAS:
+        raise HTTPException(400, "Área desconhecida.")
+    s, i = [x for x in setores.split("|") if x], [x for x in industrias.split("|") if x]
+    chave = (area, tuple(sorted(s)), tuple(sorted(i)), float(mcap))
+    hit = _contagens.get(chave)
+    if hit and time.time() - hit[0] < 6 * 3600:
+        return hit[1]
+    partes = [uni.listar_universo(pesq.AREAS[area][1], float(mcap) * 1e6, [], ss, industrias=ii) for ss, ii in pesq.consultas_universo(s, i)]
+    tickers = {t for p in partes if not p.empty for t in p["Ticker"]}
+    r = {"n": len(tickers), "gerado": datetime.now().strftime("%d/%m %H:%M")}
+    _contagens[chave] = (time.time(), r)
+    return r
+
+
 @app.get("/api/pesquisas/resultados")
 def pesquisas_resultados():
     """Da última procura de cada pesquisa guardada: os valores de todas as empresas analisadas e as medianas de cada

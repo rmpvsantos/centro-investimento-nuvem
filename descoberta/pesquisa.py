@@ -336,7 +336,7 @@ def normalizar(crit: dict | None) -> dict:
     return {"versao": VERSAO, "area": area_das_regioes(crit.get("regioes")), "setores": list(crit.get("setores") or []),
             "industrias": [], "metodo": "limite", "top": TOP_OMISSAO,
             "mcap": crit.get("mcap", 5000), "limite": crit.get("limite", 200), "ordem": crit.get("ordem") or ORDENS[0],
-            "criterios": criterios, "limiar": crit.get("limiar", LIMIAR_POR_OMISSAO), "grupo_mediana": "regiao",
+            "criterios": criterios, "limiar": 1.0, "grupo_mediana": "regiao",
             "min_empresas": MIN_EMPRESAS_OMISSAO, "parametros": crit.get("parametros") or asdict(Parametros()),
             "nao_convertidos": fora}
 
@@ -350,8 +350,10 @@ def _completar_v2(c: dict) -> dict:
         c["industrias"] = [c["industria"]] if c.get("industria") else []
     c.pop("setor", None)
     c.pop("industria", None)
-    if c.get("metodo") not in METODOS:
-        c["metodo"] = "mediana" if any((v or {}).get("modo") == "mediana" for v in (c.get("criterios") or {}).values()) else "limite"
+    # Desde 20/10/2026 (pedido do Rui): a triagem é um FUNIL pelos limites dele — cada critério elimina quem não o cumpre
+    # (todos obrigatórios) —, ficam as `top` melhores e a mediana do setor serve só para comparar, não para eliminar
+    c["metodo"] = "limite"
+    c["limiar"] = 1.0
     if not isinstance(c.get("top"), int) or c["top"] < 0:
         c["top"] = TOP_OMISSAO
     return c
@@ -472,7 +474,8 @@ def descricao_v2(crit: dict) -> str:
     partes += [texto_criterio_v2(k, m, lim) for k, m, lim in criterios_ativos(c)]
     total, minimo = contagem_v2(c)
     if total:
-        partes.append(f"cumprir pelo menos {minimo} de {total} critérios ({float(c.get('limiar', 1)):.0%})")
+        partes.append("cumprir todos os critérios (funil)" if minimo >= total else
+                      f"cumprir pelo menos {minimo} de {total} critérios ({float(c.get('limiar', 1)):.0%})")
     if any(m == "mediana" for _k, m, _l in criterios_ativos(c)):
         partes.append(f"mediana da indústria de cada empresa: {GRUPOS_MEDIANA.get(c.get('grupo_mediana'), GRUPOS_MEDIANA['regiao'])}")
     if c["top"]:
@@ -591,9 +594,11 @@ def executar_v2(crit: dict, progresso=None) -> dict:
     grandes = {g for g, x in g_ind.items() if x["n"] >= min_emp}
     pequenas = sorted({str(x) for x in (df["Indústria"] if "Indústria" in df else []) if pd.notna(x) and str(x).strip() and str(x) not in grandes})
     pares_setor = pares
-    if usa_mediana and industrias and pequenas:
-        # escolheram-se indústrias: o resto do setor não foi analisado; analisa-se agora, só para a mediana do setor
-        setores_falta = setores_para_mediana(df, pequenas, consultas)
+    if industrias:
+        # escolheram-se indústrias: o resto do setor não foi analisado; analisa-se agora, só para a mediana do setor (com
+        # que as empresas se comparam na tabela; desde 20/10/2026 a mediana não elimina ninguém)
+        todas = sorted({str(x) for x in (df["Indústria"] if "Indústria" in df else []) if pd.notna(x) and str(x).strip()})
+        setores_falta = setores_para_mediana(df, todas, consultas)
         if setores_falta:
             regs_pares = regs if grupo_med == "regiao" else regs + outra_area
             pares_setor = juntar(pares, analisar(regs_pares, [(setores_falta, None)])[0])
@@ -603,6 +608,9 @@ def executar_v2(crit: dict, progresso=None) -> dict:
     if usa_mediana and pequenas:
         nota = (f"indústrias com menos de {min_emp} empresas analisadas, comparadas com a mediana do setor: "
                 + ", ".join(pequenas[:8]) + (f" e mais {len(pequenas) - 8}" if len(pequenas) > 8 else ""))
+    pequenos_setores = [g for g, x in grupos.items() if x.get("nivel") == "setor" and x["n"] < min_emp]
+    if not usa_mediana and pequenos_setores:
+        nota = f"mediana do setor com menos de {min_emp} empresas (pouco fiável): {', '.join(pequenos_setores)}"
 
     limiar = float(c.get("limiar", LIMIAR_POR_OMISSAO))
     empresas, avals = [], []
