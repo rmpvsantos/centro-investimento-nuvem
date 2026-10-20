@@ -34,10 +34,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: py
         with:
           python-version: "3.12"
-          cache: pip
-      - run: pip install -r requirements.txt
+      # Programas já instalados guardados entre voltas (o pip install levava 11 a 16 s em cada volta)
+      - name: Programas instalados (memória entre voltas)
+        id: venv
+        uses: actions/cache@v4
+        with:
+          path: ~/venv
+          key: venv-${{ steps.py.outputs.python-version }}-${{ hashFiles('requirements.txt') }}
+      - name: Instalar os programas (só quando a lista muda)
+        if: steps.venv.outputs.cache-hit != 'true'
+        run: python -m venv ~/venv && ~/venv/bin/pip install -r requirements.txt
+      - run: echo "$HOME/venv/bin" >> "$GITHUB_PATH"
       - name: Memória entre voltas (relatórios já descarregados e dados do Yahoo)
         uses: actions/cache@v4
         with:

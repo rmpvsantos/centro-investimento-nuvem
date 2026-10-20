@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -90,6 +91,11 @@ def ligacao(fn: str, *args, tentativas: int = 3):
             with urllib.request.urlopen(pedido, timeout=300) as r:
                 j = json.loads(r.read().decode("utf-8"))
             if j.get("erro"):
+                # falhas passageiras do Google (Drive ou bloqueio ocupado): repete; os outros erros sobem logo
+                if i < tentativas - 1 and re.search(r"Service error|Serviço|temporar|Lock|bloqueio|try again|Limit Exceeded", str(j["erro"]), re.I):
+                    registar(f"  {fn}: falha passageira do Google ({str(j['erro'])[:80]}); nova tentativa.")
+                    time.sleep(3 * (i + 1))
+                    continue
                 raise RuntimeError(f"{fn}: {j['erro']}")
             return j.get("valor")
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
@@ -505,8 +511,10 @@ def correr_pesquisas(ident: str | None = None) -> tuple[int, list[str]]:
     return r.returncode, linhas
 
 
-def tratar_pedidos(resp: Respostas) -> tuple[list[dict], set[str], bool]:
-    pedidos = ligacao("trab_pedidos") or []
+def tratar_pedidos(resp: Respostas, pedidos: list | None = None) -> tuple[list[dict], set[str], bool]:
+    if pedidos is None:
+        r = ligacao("trab_pedidos", {"servico": SERVICO["ativo"]})
+        pedidos = r.get("pedidos", []) if isinstance(r, dict) else (r or [])
     feitos, tocadas, escreveu, feitas = [], set(), False, set()
     for p in pedidos:
         app, metodo, caminho = p["app"], p["metodo"], p["caminho"]
@@ -586,6 +594,171 @@ def guardar_dados(originais: dict) -> None:
         registar("Dados gravados no Drive: " + ", ".join(novos))
 
 
+def fazer_carteira(resp: Respostas, tudo: bool, sincronizar: bool, escreveu: bool) -> None:
+    """A Carteira no Google (painel da Decisão, técnica rápida, triagens e listas pedidas lá) e o envio do que mudou."""
+    antes = {n: (PASTAS["sync"] / n).read_text(encoding="utf-8") if (PASTAS["sync"] / n).exists() else None for n in FICHEIROS_SYNC}
+    if sincronizar:
+        sincronizar_carteira(tudo)
+    else:
+        registar("Carteira: sem mudanças a sincronizar nesta volta (corre nas voltas agendadas).")
+    mudou = {n: (PASTAS["sync"] / n).read_text(encoding="utf-8") for n in FICHEIROS_SYNC
+             if n != "pedidos_carteira.json" and (PASTAS["sync"] / n).exists() and (PASTAS["sync"] / n).read_text(encoding="utf-8") != antes[n]}
+    # Proteção: um ficheiro com menos empresas do que o anterior (técnica vazia, sincronização sem análises) não
+    # substitui o que a Carteira está a mostrar
+    for n, chave in (("tecnica_carteira.json", "ativos"), ("sincronizacao_carteira.json", "decisao")):
+        if n in mudou and antes.get(n):
+            try:
+                novo, velho = json.loads(mudou[n]).get(chave) or {}, json.loads(antes[n]).get(chave) or {}
+                tam = (lambda x: len(x.get("analises", x)) if isinstance(x, dict) else 0)
+                if tam(velho) and tam(novo) < tam(velho) * 0.5:
+                    registar(f"Carteira: {n} novo com {tam(novo)} empresas (antes {tam(velho)}): não enviado.")
+                    mudou.pop(n)
+            except (ValueError, AttributeError):
+                pass
+    if mudou:
+        ligacao("trab_gravarFicheiros", {"pasta": "sync", "ficheiros": mudou})
+        for nome, texto in mudou.items():
+            lembrar("sync", nome, texto)
+        registar("Carteira: enviados " + ", ".join(mudou))
+        resp.calcular("c", "/api/decisao/resumo")
+        resp.enviar()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Trabalhador de serviço (20/10/2026, o Rui achou a app «extremamente lenta»): cada clique lançava uma volta nova (2 min
+# de arranque: máquina, programas, dados, lista dos relatórios) e as voltas faziam fila. Agora, depois de um pedido da
+# app, o trabalhador fica SERVICO_MIN minutos à espera de mais, com tudo já arrancado, e pergunta à fila de ESPERA_FILA
+# em ESPERA_FILA segundos (só lê o Drive quando a app marcou pedidos novos). Enquanto dá sinal de vida, a ligação não
+# lança outra volta (Nuvem.js: trab_vivo, trab_sair, VIVO_MS).
+# ---------------------------------------------------------------------------------------------------------------------
+SERVICO = {"ativo": False}
+SERVICO_MIN = float(os.environ.get("TRAB_SERVICO_MIN") or 8)  # (o ensaio local encurta-o)
+ESPERA_FILA = 3
+
+
+class SinalDeVida:
+    """Sinal de vida de 10 em 10 s, também enquanto um pedido demora (analisar uma empresa nova, procurar)."""
+
+    def __init__(self):
+        self.parar = threading.Event()
+        self.fio = threading.Thread(target=self._correr, daemon=True)
+
+    def _correr(self):
+        while not self.parar.wait(10):
+            try:
+                ligacao("trab_vivo", tentativas=1)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def __enter__(self):
+        SERVICO["vida"] = self
+        self.fio.start()
+        return self
+
+    def __exit__(self, *_):
+        self.parar.set()
+        self.fio.join(timeout=60)
+
+
+def relancar(motivo: str) -> None:
+    """Lança outra volta (o GITHUB_TOKEN desta execução pode lançar o fluxo pelo workflow_dispatch)."""
+    repo = os.environ.get("GITHUB_REPOSITORY", "rmpvsantos/centro-investimento-nuvem")
+    pedido = urllib.request.Request(f"https://api.github.com/repos/{repo}/actions/workflows/trabalho.yml/dispatches", method="POST",
+                                    data=json.dumps({"ref": "main", "inputs": {"motivo": motivo}}).encode("utf-8"),
+                                    headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"})
+    try:
+        urllib.request.urlopen(pedido, timeout=30).close()
+        registar(f"Lançada outra volta: {motivo}.")
+    except Exception as e:  # noqa: BLE001
+        registar(f"Não consegui lançar outra volta ({e}); os pedidos ficam para a próxima.")
+
+
+def acabar_servico() -> None:
+    """Pára o sinal de vida e, se ficaram pedidos por fazer, lança outra volta (nada fica preso à espera)."""
+    if not SERVICO["ativo"]:
+        return
+    SERVICO["ativo"] = False
+    vida = SERVICO.get("vida")
+    if vida:
+        vida.__exit__()
+    try:
+        # só uma nova tentativa: se a volta relançada também falhar, os pedidos esperam pelo próximo clique ou pela agendada
+        if ligacao("trab_sair") and os.environ.get("MOTIVO") != "pedidos por fazer no fim da volta":
+            relancar("pedidos por fazer no fim da volta")
+    except Exception as e:  # noqa: BLE001
+        registar(f"Fim do serviço: a ligação não respondeu ({e}).")
+
+
+def tratar_lote(resp: Respostas, originais: dict, pedidos: list | None = None, globais: bool = True) -> tuple[int, bool, set]:
+    """Um lote de pedidos da app: faz, calcula o que as páginas mostram, envia e dá-os por concluídos."""
+    feitos, tocadas, escreveu = tratar_pedidos(resp, pedidos)
+    try:
+        if globais or escreveu:  # num lote só de leituras, as páginas gerais não mudaram
+            for c in GLOBAIS_D:
+                resp.calcular("d", c)
+            for c in GLOBAIS_C:
+                resp.calcular("c", c)
+        for t in tocadas:
+            try:
+                empresa(resp, t)
+            except Exception as e:  # noqa: BLE001
+                registar(f"Empresa {t} falhou: {e}")
+        resp.enviar()
+        guardar_dados(originais)
+    finally:  # os pedidos dão-se sempre por concluídos (a página deixa de esperar), mesmo se o envio falhou
+        if feitos:
+            ligacao("trab_concluirPedidos", feitos)
+    return len(feitos), escreveu, tocadas
+
+
+def de_servico(resp: Respostas, originais: dict) -> tuple[int, bool]:
+    """Fica à espera de pedidos até SERVICO_MIN minutos sem nenhum. Devolve (pedidos feitos, se gravou alguma coisa)."""
+    total, escreveu, ultimo, ultima_leitura, falhas = 0, False, time.time(), 0.0, 0
+    registar(f"De serviço: à espera de mais pedidos durante {SERVICO_MIN} min.")
+    while True:
+        with SinalDeVida():
+            while time.time() - ultimo < SERVICO_MIN * 60:
+                completo = time.time() - ultima_leitura > 60  # de minuto a minuto lê a fila toda, por segurança
+                try:
+                    r = ligacao("trab_pedidos", {"servico": True, "rapido": not completo}, tentativas=2)
+                    falhas = 0
+                except Exception as e:  # noqa: BLE001
+                    falhas += 1
+                    registar(f"De serviço: a fila não respondeu ({str(e)[:100]}).")
+                    if falhas >= 5:
+                        return total, escreveu
+                    time.sleep(10)
+                    continue
+                if completo:
+                    ultima_leitura = time.time()
+                pedidos = r.get("pedidos", []) if isinstance(r, dict) else (r or [])
+                if isinstance(r, dict) and r.get("carteira"):
+                    registar("De serviço: a Carteira deixou pedidos.")
+                    for nome, texto in ler_drive("sync", FICHEIROS_SYNC).items():
+                        if texto:
+                            (PASTAS["sync"] / nome).write_text(texto, encoding="utf-8")
+                    fazer_carteira(resp, False, True, False)
+                    ultimo = time.time()
+                if pedidos:
+                    t0 = time.time()
+                    n, esc, _t = tratar_lote(resp, originais, pedidos, globais=False)
+                    total, escreveu = total + n, escreveu or esc
+                    registar_sinais(resp)
+                    registar(f"De serviço: {n} pedido(s) em {time.time() - t0:.0f} s.")
+                    ultimo = time.time()
+                    continue
+                time.sleep(ESPERA_FILA)
+        # sem sinal de vida (o fio já parou): a ligação confirma que não chegou nada entretanto
+        try:
+            if not ligacao("trab_sair"):
+                break
+        except Exception:  # noqa: BLE001
+            break
+        ultimo = time.time()
+    registar(f"Fim do serviço: {total} pedido(s) atendidos.")
+    return total, escreveu
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tudo", action="store_true")
@@ -598,6 +771,10 @@ def main() -> int:
     TRAB.mkdir(parents=True, exist_ok=True)
     for p in PASTAS.values():
         p.mkdir(parents=True, exist_ok=True)
+    # Num pedido da app, o trabalhador fica de serviço (ver de_servico) e dá sinal de vida logo desde o arranque, para os
+    # cliques seguintes não lançarem outra volta: ficam para ele
+    SERVICO["ativo"] = not (args.tudo or args.pesquisa)
+    vida = SinalDeVida().__enter__() if SERVICO["ativo"] else None
 
     # 1. Dados, relatórios e sincronização da Carteira. Nas voltas agendadas (e em «Atualizar agora») descarrega-se tudo de
     # raiz; nos pedidos da app usa-se a cópia guardada dos ficheiros iguais aos do Drive
@@ -629,25 +806,20 @@ def main() -> int:
     resp = Respostas()
     erro = None
     feitos: list[dict] = []
+    n_pedidos = 0
     try:
         if args.pesquisa:
             correr_pesquisas()
         # 2. Pedidos da app, com as respostas gerais e as das empresas tocadas; a app recebe-os logo
-        feitos, tocadas, escreveu = tratar_pedidos(resp)
-        for c in GLOBAIS_D:
-            resp.calcular("d", c)
-        for c in GLOBAIS_C:
-            resp.calcular("c", c)
-        for t in tocadas:
-            try:
-                empresa(resp, t)
-            except Exception as e:  # noqa: BLE001
-                registar(f"Empresa {t} falhou: {e}")
-        resp.enviar()
-        guardar_dados(originais)
-        if feitos:
-            ligacao("trab_concluirPedidos", feitos)
-            feitos = []
+        n_pedidos, escreveu, tocadas = tratar_lote(resp, originais)
+        if vida:
+            vida.__exit__()
+            vida = None
+        # 2b. De serviço: os pedidos seguintes são atendidos em segundos, sem nova volta
+        if SERVICO["ativo"]:
+            registar_sinais(resp)
+            n, esc = de_servico(resp, originais)
+            n_pedidos, escreveu = n_pedidos + n, escreveu or esc
         # 3. Voltas agendadas: todas as empresas seguidas
         if args.tudo or args.pesquisa:
             for t in [t for t in seguidas() if t not in tocadas]:
@@ -669,40 +841,12 @@ def main() -> int:
         # 4. A Carteira no Google (painel da Decisão, técnica rápida, triagens e listas pedidas lá): nas voltas agendadas,
         # quando a app gravou alguma coisa (mudar de lista, notas, regras) ou quando a Carteira deixou pedidos por tratar.
         # Num clique só de leitura não corre (era 1,5 minutos que atrasavam o pedido seguinte).
-        if not (args.tudo or args.pesquisa or escreveu or carteira_pediu()):
-            registar("Carteira: sem mudanças a sincronizar nesta volta (corre nas voltas agendadas).")
-            return_sem_carteira = True
-        else:
-            return_sem_carteira = False
-        antes = {n: (PASTAS["sync"] / n).read_text(encoding="utf-8") if (PASTAS["sync"] / n).exists() else None for n in FICHEIROS_SYNC}
-        if not return_sem_carteira:
-            sincronizar_carteira(args.tudo)
-        mudou = {n: (PASTAS["sync"] / n).read_text(encoding="utf-8") for n in FICHEIROS_SYNC
-                 if n != "pedidos_carteira.json" and (PASTAS["sync"] / n).exists() and (PASTAS["sync"] / n).read_text(encoding="utf-8") != antes[n]}
-        # Proteção: um ficheiro com menos empresas do que o anterior (técnica vazia, sincronização sem análises) não
-        # substitui o que a Carteira está a mostrar
-        for n, chave in (("tecnica_carteira.json", "ativos"), ("sincronizacao_carteira.json", "decisao")):
-            if n in mudou and antes.get(n):
-                try:
-                    novo, velho = json.loads(mudou[n]).get(chave) or {}, json.loads(antes[n]).get(chave) or {}
-                    tam = (lambda x: len(x.get("analises", x)) if isinstance(x, dict) else 0)
-                    if tam(velho) and tam(novo) < tam(velho) * 0.5:
-                        registar(f"Carteira: {n} novo com {tam(novo)} empresas (antes {tam(velho)}): não enviado.")
-                        mudou.pop(n)
-                except (ValueError, AttributeError):
-                    pass
-        if mudou:
-            ligacao("trab_gravarFicheiros", {"pasta": "sync", "ficheiros": mudou})
-            for nome, texto in mudou.items():
-                lembrar("sync", nome, texto)
-            registar("Carteira: enviados " + ", ".join(mudou))
-            if escreveu or len(mudou) > 0:
-                resp.calcular("c", "/api/decisao/resumo")
-                resp.enviar()
+        fazer_carteira(resp, args.tudo, bool(args.tudo or args.pesquisa or escreveu or carteira_pediu()), escreveu)
     except Exception as e:  # noqa: BLE001
         erro = f"{type(e).__name__}: {e}"
         registar("ERRO: " + erro)
     finally:
+        acabar_servico()  # rede de segurança: pedidos por fazer (ex.: a volta falhou) lançam outra volta já
         # 5. Dados alterados de volta ao Drive; pedidos que faltem concluir; estado da volta
         guardar_dados(originais)
         if feitos:
@@ -710,7 +854,7 @@ def main() -> int:
         ligacao("trab_gravarFicheiros", {"pasta": "nuvem", "ficheiros": {"estado.json": json.dumps({
             "inicio": inicio.isoformat(timespec="seconds"), "fim": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "motivo": os.environ.get("MOTIVO") or ("pesquisa" if args.pesquisa else "agendada" if args.tudo else "pedido"),
-            "completa": bool(args.tudo or args.pesquisa), "pedidos": len(feitos), "relatorios": SINCRONIA,
+            "completa": bool(args.tudo or args.pesquisa), "pedidos": n_pedidos, "relatorios": SINCRONIA,
             "transferencia": {k: TRANSFERENCIA[k] for k in ("iguais", "descarregados", "memoria")},
             "erro": erro, "registo": REGISTO[-60:]}, ensure_ascii=False)}})
         for p in procs:
@@ -719,4 +863,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    finally:
+        acabar_servico()  # também se a volta rebentar antes dos pedidos (ex.: o Drive falhou ao ler os dados)
